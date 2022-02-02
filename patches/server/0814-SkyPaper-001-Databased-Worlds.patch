@@ -1,0 +1,2408 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Heath <Github@HeathLoganCampbell.com>
+Date: Sun, 10 Oct 2021 23:31:38 +1300
+Subject: [PATCH] [SkyPaper-001] Databased Worlds
+
+It works pretty simply by making direct mapping from files to database.
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index d80cfcb94db51440b5d0aa589a9a3d8a4189a9aa..afef0c4ef696897232e795b40bff2cf52516767a 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -61,6 +61,7 @@ dependencies {
+ 
+     implementation("co.aikar:cleaner:1.0-SNAPSHOT") // Paper
+     implementation("io.netty:netty-all:4.1.65.Final") // Paper
++    implementation("com.zaxxer:HikariCP:5.0.0") // SkySpigot
+ 
+     implementation("org.quiltmc:tiny-mappings-parser:0.3.0") // Paper - needed to read mappings for stacktrace deobfuscation
+     implementation("com.velocitypowered:velocity-native:1.1.0-SNAPSHOT") // Paper
+diff --git a/src/main/java/dev/cobblesword/skypaper/SkyPaper.java b/src/main/java/dev/cobblesword/skypaper/SkyPaper.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3e4621a579d3b39f5fb2f8051e789bc3c2d8a31
+--- /dev/null
++++ b/src/main/java/dev/cobblesword/skypaper/SkyPaper.java
+@@ -0,0 +1,74 @@
++package dev.cobblesword.skypaper;
++
++import com.zaxxer.hikari.HikariConfig;
++import com.zaxxer.hikari.HikariDataSource;
++import dev.cobblesword.skypaper.database.WorldChunkedDataDao;
++import dev.cobblesword.skypaper.database.WorldDao;
++import dev.cobblesword.skypaper.database.WorldDataCacheDao;
++
++import java.sql.Connection;
++import java.sql.SQLException;
++
++public class SkyPaper
++{
++    public static SkyPaper INSTANCE = new SkyPaper();
++
++    private HikariDataSource dataSource;
++
++    private WorldDao worldDao;
++    private WorldDataCacheDao worldDataCacheDao;
++    private WorldChunkedDataDao worldChunkDao;
++
++    public SkyPaper()
++    {
++    }
++
++    public void onEnable()
++    {
++        HikariConfig config = new HikariConfig();
++        config.setJdbcUrl("jdbc:mysql://localhost:3306/skyblock");
++        config.setUsername("root");
++        config.setPassword("root");
++        config.addDataSourceProperty("cachePrepStmts", "true");
++        config.addDataSourceProperty("prepStmtCacheSize", "250");
++        config.addDataSourceProperty("prepStmtCacheSqlLimit", "2048");
++
++        dataSource = new HikariDataSource(config);
++
++        this.worldDao = new WorldDao();
++        this.worldDataCacheDao = new WorldDataCacheDao();
++        this.worldChunkDao = new WorldChunkedDataDao();
++
++        org.spigotmc.SpigotConfig.disablePlayerDataSaving = true;
++    }
++
++    public void onDisable()
++    {
++
++    }
++
++    public Connection getConnection() throws SQLException
++    {
++        return dataSource.getConnection();
++    }
++
++    public WorldDao getWorldDao()
++    {
++        return this.worldDao;
++    }
++
++    public WorldDataCacheDao getWorldDataCacheDao()
++    {
++        return this.worldDataCacheDao;
++    }
++
++    public WorldChunkedDataDao getWorldChunkDao()
++    {
++        return this.worldChunkDao;
++    }
++
++    public static boolean isDataPacksDisabled()
++    {
++        return true;
++    }
++}
+diff --git a/src/main/java/dev/cobblesword/skypaper/database/WorldChunkedDataDao.java b/src/main/java/dev/cobblesword/skypaper/database/WorldChunkedDataDao.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ebcd36ecbec33056f2e82d957113ab435335cf79
+--- /dev/null
++++ b/src/main/java/dev/cobblesword/skypaper/database/WorldChunkedDataDao.java
+@@ -0,0 +1,231 @@
++package dev.cobblesword.skypaper.database;
++
++import ca.spottedleaf.dataconverter.types.ObjectType;
++import dev.cobblesword.skypaper.SkyPaper;
++import dev.cobblesword.skypaper.database.dto.WorldDTO;
++import net.minecraft.nbt.*;
++import net.minecraft.world.level.ChunkPos;
++
++import javax.sql.rowset.serial.SerialBlob;
++import java.io.*;
++import java.sql.*;
++import java.util.Base64;
++import java.util.UUID;
++import java.util.zip.GZIPInputStream;
++import java.util.zip.GZIPOutputStream;
++
++public class WorldChunkedDataDao
++{
++    public CompoundTag loadWorldChunk(String dataType, int worldDatabaseId, ChunkPos chunkPos)
++    {
++        long chunkIndex =  chunkPos.toLong();
++
++        Connection connection = null;
++        PreparedStatement prepareStatement = null;
++        try
++        {
++            connection = SkyPaper.INSTANCE.getConnection();
++            prepareStatement = connection.prepareStatement("SELECT * FROM `worldchunk_" + dataType + "` WHERE `world_id` = ? AND `chunk_index` = ?");
++            prepareStatement.setInt(1, worldDatabaseId);
++            prepareStatement.setLong(2, chunkIndex);
++            ResultSet rs = prepareStatement.executeQuery();
++
++            if (!rs.next()) {
++                // no chunk found
++                return null;
++            }
++
++            Blob nbt = rs.getBlob("nbt");
++
++            CompoundTag nbttagcompound;
++
++            InputStream binaryStream = nbt.getBinaryStream();
++            DataInputStream datainputstream = new DataInputStream(new BufferedInputStream(new GZIPInputStream(binaryStream)));
++
++            try
++            {
++                nbttagcompound = NbtIo.read(datainputstream, NbtAccounter.UNLIMITED);
++            }
++            catch (Throwable throwable)
++            {
++                try
++                {
++                    binaryStream.close();
++                    datainputstream.close();
++                }
++                catch (Throwable throwable1)
++                {
++                    throwable.addSuppressed(throwable1);
++                }
++
++                throw throwable;
++            }
++
++            datainputstream.close();
++            binaryStream.close();
++            return nbttagcompound;
++        }
++        catch (Exception ex)
++        {
++            ex.printStackTrace();
++        }
++        finally
++        {
++            try {
++                if(connection != null && !connection.isClosed()) connection.close();
++                if(prepareStatement != null && !prepareStatement.isClosed()) prepareStatement.close();
++            } catch (SQLException e) {
++                e.printStackTrace();
++            }
++        }
++
++        return null;
++    }
++
++    private boolean isEmptyChunk(CompoundTag compound)
++    {
++        CompoundTag level = compound.getCompound("Level");
++        ListTag sections = level.getList("Sections", 10);
++        CompoundTag tileEntities = level.getCompound("TileEntities");
++        CompoundTag entities = level.getCompound("Entities");
++
++        for (int i = 0; i < sections.size(); i++)
++        {
++            CompoundTag section = sections.getCompound(i);
++            ListTag palette = section.getList("Palette", 10);
++            if(palette.size() > 1)
++            {
++                // contains more than just air
++                return false;
++            }
++
++            for (int j = 0; j < palette.size(); j++)
++            {
++                CompoundTag paletteBlock = palette.getCompound(j);
++                String blockType = paletteBlock.getString("Name");
++                if(!blockType.equals("minecraft:air"))
++                {
++                    return false;
++                }
++            }
++        }
++
++        if(tileEntities.size() == 0 && entities.size() == 0)
++        {
++            // Don't save chunks with no meaningful information, in this case it'll only be saving biome data
++            return true;
++        }
++
++        return false;
++    }
++
++    public void saveWorldChunk(String dataType, int worldDatabaseId, ChunkPos pos, CompoundTag compound)
++    {
++        if(compound == null)
++        {
++            return;
++        }
++
++        long chunkIndex = pos.toLong();
++
++        if(dataType.equals("region"))
++        {
++            // Don't save empty chunks
++            if(isEmptyChunk(compound))
++            {
++                return;
++            }
++        }
++
++        try {
++            Connection connection = SkyPaper.INSTANCE.getConnection();
++
++            PreparedStatement prepareStatement = connection.prepareStatement("INSERT INTO `worldchunk_" + dataType + "`(`id`, `world_id`, `chunk_x`, `chunk_z`, `chunk_index`, `nbt`) VALUES (NULL, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE nbt = ?");
++            ByteArrayOutputStream stream = null;
++            DataOutputStream dataoutputstream = null;
++
++            Blob blob = null;
++
++            try {
++                stream = new ByteArrayOutputStream();
++                BufferedOutputStream bufferOut = new BufferedOutputStream(new GZIPOutputStream(stream));
++                dataoutputstream = new DataOutputStream(bufferOut);
++                DataOutput output = dataoutputstream;
++
++                output.writeByte(compound.getId());
++                if (compound.getId() != 0)
++                {
++                    output.writeUTF("");
++                    compound.write(output);
++                }
++
++                dataoutputstream.close();
++                blob = new SerialBlob(stream.toByteArray());
++            }
++            catch (Throwable throwable)
++            {
++                throw throwable;
++            }
++            finally
++            {
++                if(stream != null) stream.close();
++                if(dataoutputstream != null) dataoutputstream.close();
++            }
++
++            prepareStatement.setInt(1, worldDatabaseId);
++            prepareStatement.setInt(2, pos.x);
++            prepareStatement.setInt(3, pos.z);
++            prepareStatement.setLong(4, chunkIndex);
++            prepareStatement.setBlob(5, blob);
++            prepareStatement.setBlob(6, blob);
++
++            prepareStatement.executeUpdate();
++            prepareStatement.close();
++            connection.close();
++        } catch (SQLException | IOException e) {
++            e.printStackTrace();
++        }
++    }
++
++    public WorldDTO loadOrCreateUID(String levelId)
++    {
++        Connection connection = null;
++        PreparedStatement prepareStatement = null;
++        try {
++            connection = SkyPaper.INSTANCE.getConnection();
++
++            prepareStatement = connection.prepareStatement("SELECT * FROM world WHERE level_id = ?");
++            prepareStatement.setString(1, levelId);
++            ResultSet resultSet = prepareStatement.executeQuery();
++            if (resultSet.next())
++            {
++                int databaseId = resultSet.getInt("id");
++                String uid = resultSet.getString("uid");
++                return new WorldDTO(databaseId, UUID.fromString(uid));
++            }
++
++            UUID newUID = UUID.randomUUID();
++
++            prepareStatement = connection.prepareStatement("INSERT INTO `world`(`id`, `level_id`, `uid`) VALUES (NULL, ?, ?)", Statement.RETURN_GENERATED_KEYS);
++            prepareStatement.setString(1, levelId);
++            prepareStatement.setString(2, newUID.toString());
++            prepareStatement.executeUpdate();
++
++            ResultSet generatedKeys = prepareStatement.getGeneratedKeys();
++            int databaseId = generatedKeys.getInt(1);
++
++            return new WorldDTO(databaseId, newUID);
++        } catch (SQLException e) {
++            e.printStackTrace();
++        } finally {
++            try {
++                prepareStatement.close();
++                connection.close();
++            } catch (SQLException e) {
++                e.printStackTrace();
++            }
++        }
++
++        return null;
++    }
++}
+diff --git a/src/main/java/dev/cobblesword/skypaper/database/WorldDao.java b/src/main/java/dev/cobblesword/skypaper/database/WorldDao.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..21c835db3f53a36757dd98ef7449232c1e7b8c14
+--- /dev/null
++++ b/src/main/java/dev/cobblesword/skypaper/database/WorldDao.java
+@@ -0,0 +1,175 @@
++package dev.cobblesword.skypaper.database;
++
++import dev.cobblesword.skypaper.SkyPaper;
++import dev.cobblesword.skypaper.database.dto.WorldDTO;
++import net.minecraft.nbt.CompoundTag;
++import net.minecraft.nbt.NbtAccounter;
++import net.minecraft.nbt.NbtIo;
++import org.apache.commons.lang3.tuple.Pair;
++
++import javax.sql.rowset.serial.SerialBlob;
++import java.io.*;
++import java.sql.*;
++import java.util.Base64;
++import java.util.UUID;
++import java.util.zip.GZIPInputStream;
++import java.util.zip.GZIPOutputStream;
++
++public class WorldDao
++{
++    public CompoundTag loadWorldData(String levelId)
++    {
++        Connection connection = null;
++        PreparedStatement prepareStatement = null;
++        try
++        {
++            connection = SkyPaper.INSTANCE.getConnection();
++            prepareStatement = connection.prepareStatement("SELECT * FROM worlddata WHERE level_id = ?");
++            prepareStatement.setString(1, levelId);
++            ResultSet rs = prepareStatement.executeQuery();
++
++            if (!rs.next()) {
++                // no worlds found
++                return null;
++            }
++
++            Blob nbt = rs.getBlob("nbt");
++
++            CompoundTag nbttagcompound;
++
++            InputStream binaryStream = nbt.getBinaryStream();
++            DataInputStream datainputstream = new DataInputStream(new BufferedInputStream(new GZIPInputStream(binaryStream)));
++
++            try
++            {
++                nbttagcompound = NbtIo.read(datainputstream, NbtAccounter.UNLIMITED);
++            }
++            catch (Throwable throwable)
++            {
++                try
++                {
++                    binaryStream.close();
++                    datainputstream.close();
++                }
++                catch (Throwable throwable1)
++                {
++                    throwable.addSuppressed(throwable1);
++                }
++
++                throw throwable;
++            }
++
++            datainputstream.close();
++            binaryStream.close();
++            return nbttagcompound;
++        }
++        catch (Exception ex)
++        {
++            ex.printStackTrace();
++        }
++        finally
++        {
++            try {
++                if(connection != null && !connection.isClosed()) connection.close();
++                if(prepareStatement != null && !prepareStatement.isClosed()) prepareStatement.close();
++            } catch (SQLException e) {
++                e.printStackTrace();
++            }
++        }
++
++        return null;
++    }
++
++    public void saveWorldData(String levelId, CompoundTag compound)
++    {
++        try {
++            Connection connection = SkyPaper.INSTANCE.getConnection();
++
++            PreparedStatement prepareStatement = connection.prepareStatement("INSERT INTO worlddata (id,level_id,nbt) VALUES (NULL, ?, ?) ON DUPLICATE KEY UPDATE nbt = ?");
++            ByteArrayOutputStream stream = null;
++            DataOutputStream dataoutputstream = null;
++
++            Blob blob = null;
++
++            try {
++                stream = new ByteArrayOutputStream();
++                BufferedOutputStream bufferOut = new BufferedOutputStream(new GZIPOutputStream(stream));
++                dataoutputstream = new DataOutputStream(bufferOut);
++                DataOutput output = dataoutputstream;
++
++                output.writeByte(compound.getId());
++                if (compound.getId() != 0)
++                {
++                    output.writeUTF("");
++                    compound.write(output);
++                }
++
++                dataoutputstream.close();
++                blob = new SerialBlob(stream.toByteArray());
++            }
++            catch (Throwable throwable)
++            {
++                throw throwable;
++            }
++            finally
++            {
++                if(stream != null) stream.close();
++                if(dataoutputstream != null) dataoutputstream.close();
++            }
++
++            prepareStatement.setString(1, levelId);
++            prepareStatement.setBlob(2, blob);
++            prepareStatement.setBlob(3, blob);
++
++            prepareStatement.executeUpdate();
++            prepareStatement.close();
++            connection.close();
++        } catch (SQLException e) {
++            e.printStackTrace();
++        } catch (IOException e) {
++            e.printStackTrace();
++        }
++    }
++
++    public WorldDTO loadOrCreateUID(String levelId)
++    {
++        Connection connection = null;
++        PreparedStatement prepareStatement = null;
++        try {
++            connection = SkyPaper.INSTANCE.getConnection();
++
++            prepareStatement = connection.prepareStatement("SELECT * FROM world WHERE level_id = ?");
++            prepareStatement.setString(1, levelId);
++            ResultSet resultSet = prepareStatement.executeQuery();
++            if (resultSet.next())
++            {
++                int databaseId = resultSet.getInt("id");
++                String uid = resultSet.getString("uid");
++                return new WorldDTO(databaseId, UUID.fromString(uid));
++            }
++
++            UUID newUID = UUID.randomUUID();
++
++            prepareStatement = connection.prepareStatement("INSERT INTO `world`(`id`, `level_id`, `uid`) VALUES (NULL, ?, ?)", Statement.RETURN_GENERATED_KEYS);
++            prepareStatement.setString(1, levelId);
++            prepareStatement.setString(2, newUID.toString());
++            prepareStatement.executeUpdate();
++
++            ResultSet generatedKeys = prepareStatement.getGeneratedKeys();
++            generatedKeys.next();
++            int databaseId = generatedKeys.getInt(1);
++            return new WorldDTO(databaseId, newUID);
++        } catch (SQLException e) {
++            e.printStackTrace();
++        } finally {
++            try {
++                prepareStatement.close();
++                connection.close();
++            } catch (SQLException e) {
++                e.printStackTrace();
++            }
++        }
++
++        return null;
++    }
++}
+diff --git a/src/main/java/dev/cobblesword/skypaper/database/WorldDataCacheDao.java b/src/main/java/dev/cobblesword/skypaper/database/WorldDataCacheDao.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..cceb9295145dd83ce1afe81536dda60966b60419
+--- /dev/null
++++ b/src/main/java/dev/cobblesword/skypaper/database/WorldDataCacheDao.java
+@@ -0,0 +1,124 @@
++package dev.cobblesword.skypaper.database;
++
++import dev.cobblesword.skypaper.SkyPaper;
++import net.minecraft.nbt.CompoundTag;
++import net.minecraft.nbt.NbtAccounter;
++import net.minecraft.nbt.NbtIo;
++
++import javax.sql.rowset.serial.SerialBlob;
++import java.io.*;
++import java.sql.*;
++import java.util.Base64;
++import java.util.UUID;
++import java.util.zip.GZIPInputStream;
++import java.util.zip.GZIPOutputStream;
++
++public class WorldDataCacheDao
++{
++    public CompoundTag loadWorldDataCache(int worldDataId, String fileName)
++    {
++        try
++        {
++            Connection connection = SkyPaper.INSTANCE.getConnection();
++            PreparedStatement prepareStatement = connection.prepareStatement("SELECT * FROM worldproperties WHERE worlddata_id = ? AND file_name = ?");
++            prepareStatement.setInt(1, worldDataId);
++            prepareStatement.setString(2, fileName);
++            ResultSet rs = prepareStatement.executeQuery();
++
++            if (!rs.next()) {
++                // no cache found
++                return null;
++            }
++
++            Blob nbt = rs.getBlob("nbt");
++
++            CompoundTag nbttagcompound;
++
++            InputStream binaryStream = nbt.getBinaryStream();
++            DataInputStream datainputstream = new DataInputStream(new BufferedInputStream(new GZIPInputStream(binaryStream)));
++
++            try
++            {
++                nbttagcompound = NbtIo.read(datainputstream, NbtAccounter.UNLIMITED);
++            }
++            catch (Throwable throwable)
++            {
++                try
++                {
++                    binaryStream.close();
++                    datainputstream.close();
++                }
++                catch (Throwable throwable1)
++                {
++                    throwable.addSuppressed(throwable1);
++                }
++
++                throw throwable;
++            }
++
++            datainputstream.close();
++            binaryStream.close();
++            return nbttagcompound;
++        }
++        catch (Exception ex)
++        {
++            ex.printStackTrace();
++        }
++
++        return null;
++    }
++
++    public void saveWorldDataCache(int worldId, String fileName, CompoundTag compound)
++    {
++        try {
++            Connection connection = SkyPaper.INSTANCE.getConnection();
++
++            PreparedStatement prepareStatement = connection.prepareStatement("INSERT INTO `worldproperties`(`id`, `worlddata_id`, `file_name`, `nbt`, `update_timestamp`) VALUES (NULL, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE nbt = ?, update_timestamp = ?");
++            ByteArrayOutputStream stream = null;
++            DataOutputStream dataoutputstream = null;
++
++            Blob blob = null;
++
++            try {
++                stream = new ByteArrayOutputStream();
++                BufferedOutputStream bufferOut = new BufferedOutputStream(new GZIPOutputStream(stream));
++                dataoutputstream = new DataOutputStream(bufferOut);
++                DataOutput output = dataoutputstream;
++
++                output.writeByte(compound.getId());
++                if (compound.getId() != 0)
++                {
++                    output.writeUTF("");
++                    compound.write(output);
++                }
++
++                dataoutputstream.close();
++                blob = new SerialBlob(stream.toByteArray());
++            }
++            catch (Throwable throwable)
++            {
++                throw throwable;
++            }
++            finally
++            {
++                if(stream != null) stream.close();
++                if(dataoutputstream != null) dataoutputstream.close();
++            }
++
++            Timestamp currentTimestamp = new Timestamp(System.currentTimeMillis());
++
++            prepareStatement.setInt(1, worldId);
++            prepareStatement.setString(2, fileName);
++            prepareStatement.setBlob(3, blob);
++            prepareStatement.setTimestamp(4, currentTimestamp);
++            prepareStatement.setBlob(5, blob);
++            prepareStatement.setTimestamp(6, currentTimestamp);
++
++            prepareStatement.executeUpdate();
++            prepareStatement.close();
++            connection.close();
++        } catch (SQLException | IOException e) {
++            e.printStackTrace();
++        }
++    }
++}
+diff --git a/src/main/java/dev/cobblesword/skypaper/database/dto/WorldDTO.java b/src/main/java/dev/cobblesword/skypaper/database/dto/WorldDTO.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b492b1d1cd254e9b8ba06f34d469e3bc4e5fea2
+--- /dev/null
++++ b/src/main/java/dev/cobblesword/skypaper/database/dto/WorldDTO.java
+@@ -0,0 +1,14 @@
++package dev.cobblesword.skypaper.database.dto;
++
++import java.util.UUID;
++
++public class WorldDTO
++{
++    public int databaseId;
++    public UUID uuid;
++
++    public WorldDTO(int databaseId, UUID uuid) {
++        this.databaseId = databaseId;
++        this.uuid = uuid;
++    }
++}
+diff --git a/src/main/java/io/papermc/paper/world/ThreadedWorldUpgrader.java b/src/main/java/io/papermc/paper/world/ThreadedWorldUpgrader.java
+index 389faf099ff64bb2845222600552c8fc2c83485f..78767ccfce7b9eaffd7825eef5e0763e8fcacf2a 100644
+--- a/src/main/java/io/papermc/paper/world/ThreadedWorldUpgrader.java
++++ b/src/main/java/io/papermc/paper/world/ThreadedWorldUpgrader.java
+@@ -1,6 +1,8 @@
+ package io.papermc.paper.world;
+ 
+ import com.mojang.datafixers.DataFixer;
++import dev.cobblesword.skypaper.SkyPaper;
++import dev.cobblesword.skypaper.database.dto.WorldDTO;
+ import net.minecraft.SharedConstants;
+ import net.minecraft.nbt.CompoundTag;
+ import net.minecraft.resources.ResourceKey;
+@@ -63,7 +65,8 @@ public class ThreadedWorldUpgrader {
+ 
+     public void convert() {
+         final File worldFolder = LevelStorageSource.getFolder(this.worldDir, this.dimensionType);
+-        final DimensionDataStorage worldPersistentData = new DimensionDataStorage(new File(worldFolder, "data"), this.dataFixer);
++        WorldDTO worldDTO = SkyPaper.INSTANCE.getWorldDao().loadOrCreateUID(this.worldDir.getName());
++        final DimensionDataStorage worldPersistentData = new DimensionDataStorage(worldDTO.databaseId, new File(worldFolder, "data"), this.dataFixer);
+ 
+         final File regionFolder = new File(worldFolder, "region");
+ 
+@@ -80,7 +83,7 @@ public class ThreadedWorldUpgrader {
+         LOGGER.info("Starting conversion now for world " + this.worldName);
+ 
+         final WorldInfo info = new WorldInfo(() -> worldPersistentData,
+-                new ChunkStorage(regionFolder, this.dataFixer, false), this.removeCaches, this.worldKey);
++                new ChunkStorage(worldDTO.databaseId, regionFolder, this.dataFixer, false), this.removeCaches, this.worldKey);
+ 
+         long expectedChunks = (long)regionFiles.length * (32L * 32L);
+ 
+diff --git a/src/main/java/net/minecraft/server/Main.java b/src/main/java/net/minecraft/server/Main.java
+index cfd43069ee2b6f79afb12e10d223f6bf75100034..4ae3d858fed8c12d80a1e9335f6f608ef3637857 100644
+--- a/src/main/java/net/minecraft/server/Main.java
++++ b/src/main/java/net/minecraft/server/Main.java
+@@ -5,8 +5,7 @@ import com.mojang.authlib.GameProfileRepository;
+ import com.mojang.authlib.minecraft.MinecraftSessionService;
+ import com.mojang.authlib.yggdrasil.YggdrasilAuthenticationService;
+ import com.mojang.datafixers.DataFixer;
+-import com.mojang.serialization.DynamicOps;
+-import com.mojang.serialization.Lifecycle;
++
+ import java.awt.GraphicsEnvironment;
+ import java.io.File;
+ import java.net.Proxy;
+@@ -15,37 +14,28 @@ import java.nio.file.Paths;
+ import java.util.Optional;
+ import java.util.concurrent.CompletableFuture;
+ import java.util.function.BooleanSupplier;
++
++import dev.cobblesword.skypaper.SkyPaper;
+ import io.papermc.paper.world.ThreadedWorldUpgrader;
+-import joptsimple.NonOptionArgumentSpec;
+-import joptsimple.OptionParser;
+ import joptsimple.OptionSet;
+-import joptsimple.OptionSpec;
+ import net.minecraft.CrashReport;
+-import net.minecraft.DefaultUncaughtExceptionHandler;
+ import net.minecraft.SharedConstants;
+ import net.minecraft.Util;
+ import net.minecraft.commands.Commands;
+ import net.minecraft.core.RegistryAccess;
+ import net.minecraft.network.chat.Component;
+ import net.minecraft.obfuscate.DontObfuscate;
+-import net.minecraft.resources.RegistryReadOps;
+ import net.minecraft.resources.ResourceKey;
+ import net.minecraft.server.dedicated.DedicatedServer;
+-import net.minecraft.server.dedicated.DedicatedServerProperties;
+ import net.minecraft.server.dedicated.DedicatedServerSettings;
+ import net.minecraft.server.level.progress.LoggerChunkProgressListener;
+ import net.minecraft.server.packs.PackType;
+-import net.minecraft.server.packs.repository.FolderRepositorySource;
+-import net.minecraft.server.packs.repository.PackRepository;
+-import net.minecraft.server.packs.repository.PackSource;
+-import net.minecraft.server.packs.repository.RepositorySource;
+-import net.minecraft.server.packs.repository.ServerPacksSource;
++import net.minecraft.server.packs.repository.*;
+ import net.minecraft.server.players.GameProfileCache;
+ import net.minecraft.util.Mth;
+ import net.minecraft.util.datafix.DataFixers;
+ import net.minecraft.util.worldupdate.WorldUpgrader;
+ import net.minecraft.world.level.DataPackConfig;
+-import net.minecraft.world.level.GameRules;
+ import net.minecraft.world.level.dimension.DimensionType;
+ import net.minecraft.world.level.dimension.LevelStem;
+ import net.minecraft.world.level.storage.LevelResource;
+@@ -55,7 +45,7 @@ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ 
+ // CraftBukkit start
+-import net.minecraft.SharedConstants;
++
+ 
+ public class Main {
+ 
+@@ -140,15 +130,16 @@ public class Main {
+             } else {
+                 file = new File(bukkitConfiguration.getString("settings.world-container", "."));
+             }
++            SkyPaper.INSTANCE.onEnable();
+             // Paper end - fix SPIGOT-5824
+             YggdrasilAuthenticationService yggdrasilauthenticationservice = new com.destroystokyo.paper.profile.PaperAuthenticationService(Proxy.NO_PROXY); // Paper
+             MinecraftSessionService minecraftsessionservice = yggdrasilauthenticationservice.createMinecraftSessionService();
+             GameProfileRepository gameprofilerepository = yggdrasilauthenticationservice.createProfileRepository();
+             GameProfileCache usercache = new GameProfileCache(gameprofilerepository, userCacheFile); // Paper - only move usercache.json into folder if --universe is used, not world-container
+             // CraftBukkit start
+-            String s = (String) Optional.ofNullable((String) optionset.valueOf("world")).orElse(dedicatedserversettings.getProperties().levelName);
++            String worldName = (String) Optional.ofNullable((String) optionset.valueOf("world")).orElse(dedicatedserversettings.getProperties().levelName);
+             LevelStorageSource convertable = LevelStorageSource.createDefault(file.toPath());
+-            LevelStorageSource.LevelStorageAccess convertable_conversionsession = convertable.c(s, LevelStem.OVERWORLD);
++            LevelStorageSource.LevelStorageAccess convertable_conversionsession = convertable.c(worldName, LevelStem.OVERWORLD);
+ 
+             MinecraftServer.convertFromRegionFormatIfNeeded(convertable_conversionsession);
+             LevelSummary worldinfo = convertable_conversionsession.getSummary();
+@@ -158,7 +149,6 @@ public class Main {
+                 return;
+             }
+ 
+-            DataPackConfig datapackconfiguration = convertable_conversionsession.getDataPacks();
+             boolean flag = optionset.has("safeMode");
+ 
+             if (flag) {
+@@ -166,24 +156,24 @@ public class Main {
+             }
+ 
+             PackRepository resourcepackrepository = new PackRepository(PackType.SERVER_DATA, new RepositorySource[]{new ServerPacksSource(), new FolderRepositorySource(convertable_conversionsession.getLevelPath(LevelResource.DATAPACK_DIR).toFile(), PackSource.WORLD)});
+-            // CraftBukkit start
+-            File bukkitDataPackFolder = new File(convertable_conversionsession.getLevelPath(LevelResource.DATAPACK_DIR).toFile(), "bukkit");
+-            if (!bukkitDataPackFolder.exists()) {
+-                bukkitDataPackFolder.mkdirs();
+-            }
+-            File mcMeta = new File(bukkitDataPackFolder, "pack.mcmeta");
+-            try {
+-                com.google.common.io.Files.write("{\n"
+-                        + "    \"pack\": {\n"
+-                        + "        \"description\": \"Data pack for resources provided by Bukkit plugins\",\n"
+-                        + "        \"pack_format\": " + SharedConstants.getCurrentVersion().getPackVersion() + "\n"
+-                        + "    }\n"
+-                        + "}\n", mcMeta, com.google.common.base.Charsets.UTF_8);
+-            } catch (java.io.IOException ex) {
+-                throw new RuntimeException("Could not initialize Bukkit datapack", ex);
+-            }
++//            // CraftBukkit start
++//            File bukkitDataPackFolder = new File(convertable_conversionsession.getLevelPath(LevelResource.DATAPACK_DIR).toFile(), "bukkit");
++//            if (!bukkitDataPackFolder.exists()) {
++//                bukkitDataPackFolder.mkdirs();
++//            }
++//            File mcMeta = new File(bukkitDataPackFolder, "pack.mcmeta");
++//            try {
++//                com.google.common.io.Files.write("{\n"
++//                        + "    \"pack\": {\n"
++//                        + "        \"description\": \"Data pack for resources provided by Bukkit plugins\",\n"
++//                        + "        \"pack_format\": " + SharedConstants.getCurrentVersion().getPackVersion() + "\n"
++//                        + "    }\n"
++//                        + "}\n", mcMeta, com.google.common.base.Charsets.UTF_8);
++//            } catch (java.io.IOException ex) {
++//                throw new RuntimeException("Could not initialize Bukkit datapack", ex);
++//            }
+             // CraftBukkit end
+-            DataPackConfig datapackconfiguration1 = MinecraftServer.configurePackRepository(resourcepackrepository, datapackconfiguration == null ? DataPackConfig.DEFAULT : datapackconfiguration, flag);
++            DataPackConfig datapackconfiguration1 = MinecraftServer.configurePackRepository(resourcepackrepository, DataPackConfig.DEFAULT, flag);
+             CompletableFuture completablefuture = ServerResources.loadResources(resourcepackrepository.openAllSelected(), iregistrycustom_dimension, Commands.CommandSelection.DEDICATED, dedicatedserversettings.getProperties().functionPermissionLevel, Util.backgroundExecutor(), Runnable::run);
+ 
+             ServerResources datapackresources;
+@@ -292,38 +282,4 @@ public class Main {
+         worldUpgrader.convert();
+     }
+     // Paper end - fix and optimise world upgrading
+-
+-    public static void forceUpgrade(LevelStorageSource.LevelStorageAccess session, DataFixer dataFixer, boolean eraseCache, BooleanSupplier booleansupplier, ImmutableSet<ResourceKey<DimensionType>> worlds) { // CraftBukkit
+-        Main.LOGGER.info("Forcing world upgrade! {}", session.getLevelId()); // CraftBukkit
+-        WorldUpgrader worldupgrader = new WorldUpgrader(session, dataFixer, worlds, eraseCache);
+-        Component ichatbasecomponent = null;
+-
+-        while (!worldupgrader.isFinished()) {
+-            Component ichatbasecomponent1 = worldupgrader.getStatus();
+-
+-            if (ichatbasecomponent != ichatbasecomponent1) {
+-                ichatbasecomponent = ichatbasecomponent1;
+-                Main.LOGGER.info(worldupgrader.getStatus().getString());
+-            }
+-
+-            int i = worldupgrader.getTotalChunks();
+-
+-            if (i > 0) {
+-                int j = worldupgrader.getConverted() + worldupgrader.getSkipped();
+-
+-                Main.LOGGER.info("{}% completed ({} / {} chunks)...", Mth.floor((float) j / (float) i * 100.0F), j, i);
+-            }
+-
+-            if (!booleansupplier.getAsBoolean()) {
+-                worldupgrader.cancel();
+-            } else {
+-                try {
+-                    Thread.sleep(1000L);
+-                } catch (InterruptedException interruptedexception) {
+-                    ;
+-                }
+-            }
+-        }
+-
+-    }
+ }
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index fe6d5051b139cd6079e288ffdf20e30fdd46fdda..070aa091094e0fb61533471b7e0650f12afd271c 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -12,6 +12,7 @@ import com.mojang.authlib.GameProfile;
+ import com.mojang.authlib.GameProfileRepository;
+ import com.mojang.authlib.minecraft.MinecraftSessionService;
+ import com.mojang.datafixers.DataFixer;
++import dev.cobblesword.skypaper.SkyPaper;
+ import io.papermc.paper.adventure.PaperAdventure; // Paper
+ import it.unimi.dsi.fastutil.longs.LongIterator;
+ import java.awt.GraphicsEnvironment;
+@@ -1209,6 +1210,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     protected void runServer() {
+         try {
+             long serverStartTime = Util.getNanos(); // Paper
++
+             if (this.initServer()) {
+                 this.nextTickTime = Util.getMillis();
+                 this.status.setDescription(new TextComponent(this.motd));
+@@ -1229,6 +1231,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+ 
+                 org.spigotmc.WatchdogThread.tick(); // Paper
+                 org.spigotmc.WatchdogThread.hasStarted = true; // Paper
++
+                 Arrays.fill( recentTps, 20 );
+                 long start = System.nanoTime(), curTime, tickSection = start; // Paper - Further improve server tick loop
+                 lastTick = start - TICK_TIME; // Paper
+@@ -1421,10 +1424,6 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+     private void updateStatusIcon(ServerStatus metadata) {
+         Optional<File> optional = Optional.of(this.getFile("server-icon.png")).filter(File::isFile);
+ 
+-        if (!optional.isPresent()) {
+-            optional = this.storageSource.getIconFile().map(Path::toFile).filter(File::isFile);
+-        }
+-
+         optional.ifPresent((file) -> {
+             try {
+                 BufferedImage bufferedimage = ImageIO.read(file);
+@@ -1445,10 +1444,6 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+         });
+     }
+ 
+-    public Optional<Path> getWorldScreenshotFile() {
+-        return this.storageSource.getIconFile();
+-    }
+-
+     public File getServerDirectory() {
+         return new File(".");
+     }
+diff --git a/src/main/java/net/minecraft/server/level/ChunkMap.java b/src/main/java/net/minecraft/server/level/ChunkMap.java
+index b3c99c1678c3ee159861c8aac38e765d664c4d1d..ff036a08755db90c186831c0bf057e47cf6b9438 100644
+--- a/src/main/java/net/minecraft/server/level/ChunkMap.java
++++ b/src/main/java/net/minecraft/server/level/ChunkMap.java
+@@ -393,7 +393,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+ 
+     boolean unloadingPlayerChunk = false; // Paper - do not allow ticket level changes while unloading chunks
+     public ChunkMap(ServerLevel world, LevelStorageSource.LevelStorageAccess session, DataFixer dataFixer, StructureManager structureManager, Executor executor, BlockableEventLoop<Runnable> mainThreadExecutor, LightChunkGetter chunkProvider, ChunkGenerator chunkGenerator, ChunkProgressListener worldGenerationProgressListener, ChunkStatusUpdateListener chunkStatusChangeListener, Supplier<DimensionDataStorage> persistentStateManagerFactory, int viewDistance, boolean dsync) {
+-        super(new File(session.getDimensionPath(world.dimension()), "region"), dataFixer, dsync);
++        super(world.databaseId, new File(session.getDimensionPath(world.dimension()), "region"), dataFixer, dsync);
+         // Paper - don't copy
+         this.pendingUnloads = new Long2ObjectLinkedOpenHashMap();
+         this.entitiesInLevel = new LongOpenHashSet();
+@@ -435,7 +435,7 @@ public class ChunkMap extends ChunkStorage implements ChunkHolder.PlayerProvider
+         this.lightEngine = new ThreadedLevelLightEngine(chunkProvider, this, this.level.dimensionType().hasSkyLight(), threadedmailbox1, this.queueSorter.getProcessor(threadedmailbox1, false));
+         this.distanceManager = new ChunkMap.ChunkDistanceManager(executor, mainThreadExecutor); this.distanceManager.chunkMap = this; // Paper
+         this.overworldDataStorage = persistentStateManagerFactory;
+-        this.poiManager = new PoiManager(new File(file, "poi"), dataFixer, dsync, world);
++        this.poiManager = new PoiManager(level.databaseId, new File(file, "poi"), dataFixer, dsync, world);
+         this.setViewDistance(viewDistance);
+         // Paper start
+         this.dataRegionManager = new io.papermc.paper.chunk.SingleThreadChunkRegionManager(this.level, 2, (1.0 / 3.0), 1, 6, "Data", DataRegionData::new, DataRegionSectionData::new);
+diff --git a/src/main/java/net/minecraft/server/level/ServerChunkCache.java b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+index 7470f3ba66c2e894b5a5b0ba392ecabf8b04aff9..66049c578a45bf4959430cc64edef5aafba98214 100644
+--- a/src/main/java/net/minecraft/server/level/ServerChunkCache.java
++++ b/src/main/java/net/minecraft/server/level/ServerChunkCache.java
+@@ -397,10 +397,9 @@ public class ServerChunkCache extends ChunkSource {
+         this.generator = chunkGenerator;
+         this.mainThread = Thread.currentThread();
+         File file = session.getDimensionPath(world.dimension());
+-        File file1 = new File(file, "data");
+ 
+-        file1.mkdirs();
+-        this.dataStorage = new DimensionDataStorage(file1, dataFixer);
++        File file1 = new File(file, "data");
++        this.dataStorage = new DimensionDataStorage(world.databaseId, file1, dataFixer);
+         this.chunkMap = new ChunkMap(world, session, dataFixer, structureManager, workerExecutor, this.mainThreadProcessor, this, this.getGenerator(), worldGenerationProgressListener, chunkstatusupdatelistener, supplier, viewDistance, flag);
+         this.lightEngine = this.chunkMap.getLightEngine();
+         this.distanceManager = this.chunkMap.getDistanceManager();
+diff --git a/src/main/java/net/minecraft/server/level/ServerLevel.java b/src/main/java/net/minecraft/server/level/ServerLevel.java
+index 9e4ad810dd6348ad95c9a7e6d1bd63f6ec37c986..9da281988eb8d7a3b8fd5346b16182e3a9b908b1 100644
+--- a/src/main/java/net/minecraft/server/level/ServerLevel.java
++++ b/src/main/java/net/minecraft/server/level/ServerLevel.java
+@@ -4,6 +4,7 @@ import com.google.common.annotations.VisibleForTesting;
+ import co.aikar.timings.TimingHistory; // Paper
+ import com.google.common.collect.Lists;
+ import com.mojang.datafixers.DataFixer;
++import dev.cobblesword.skypaper.database.dto.WorldDTO;
+ import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
+ import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+ import it.unimi.dsi.fastutil.longs.LongSet;
+@@ -103,7 +104,6 @@ import net.minecraft.world.level.ExplosionDamageCalculator;
+ import net.minecraft.world.level.ForcedChunksSavedData;
+ import net.minecraft.world.level.GameRules;
+ import net.minecraft.world.level.Level;
+-import net.minecraft.world.level.LevelReader;
+ import net.minecraft.world.level.NaturalSpawner;
+ import net.minecraft.world.level.ServerTickList;
+ import net.minecraft.world.level.StructureFeatureManager;
+@@ -168,6 +168,9 @@ public class ServerLevel extends Level implements WorldGenLevel {
+     public static final BlockPos END_SPAWN_POINT = new BlockPos(100, 50, 0);
+     private static final Logger LOGGER = LogManager.getLogger();
+     private static final int EMPTY_TIME_NO_TICK = 300;
++
++    public int databaseId = -1;
++
+     public final List<ServerPlayer> players;
+     public final ServerChunkCache chunkSource;
+     private final MinecraftServer server;
+@@ -476,7 +479,9 @@ public class ServerLevel extends Level implements WorldGenLevel {
+         super(iworlddataserver, resourcekey, dimensionmanager, minecraftserver::getProfiler, false, flag, i, gen, biomeProvider, env, executor); // Paper - Anti-Xray - Pass executor
+         this.pvpMode = minecraftserver.isPvpAllowed();
+         this.convertable = convertable_conversionsession;
+-        this.uuid = WorldUUID.getUUID(convertable_conversionsession.levelPath.toFile());
++        WorldDTO worldDTO = WorldUUID.getUUID(convertable_conversionsession.levelPath.toFile());
++        this.databaseId = worldDTO.databaseId;
++        this.uuid = worldDTO.uuid;
+         // CraftBukkit end
+         this.players = Lists.newArrayList();
+         this.entityTickList = new EntityTickList();
+diff --git a/src/main/java/net/minecraft/server/packs/repository/FolderRepositorySource.java b/src/main/java/net/minecraft/server/packs/repository/FolderRepositorySource.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..96e27fcf5f38882de4f3194afe7329072e94aaf3
+--- /dev/null
++++ b/src/main/java/net/minecraft/server/packs/repository/FolderRepositorySource.java
+@@ -0,0 +1,55 @@
++package net.minecraft.server.packs.repository;
++
++import java.io.File;
++import java.io.FileFilter;
++import java.util.function.Consumer;
++import java.util.function.Supplier;
++
++import dev.cobblesword.skypaper.SkyPaper;
++import net.minecraft.server.packs.FilePackResources;
++import net.minecraft.server.packs.FolderPackResources;
++import net.minecraft.server.packs.PackResources;
++
++public class FolderRepositorySource implements RepositorySource {
++    private static final FileFilter RESOURCEPACK_FILTER = (file) -> {
++        boolean bl = file.isFile() && file.getName().endsWith(".zip");
++        boolean bl2 = file.isDirectory() && (new File(file, "pack.mcmeta")).isFile();
++        return bl || bl2;
++    };
++    private final File folder;
++    private final PackSource packSource;
++
++    public FolderRepositorySource(File packsFolder, PackSource source) {
++        this.folder = packsFolder;
++        this.packSource = source;
++    }
++
++    @Override
++    public void loadPacks(Consumer<Pack> profileAdder, Pack.PackConstructor factory) {
++        if(SkyPaper.isDataPacksDisabled()) return;
++
++        if (!this.folder.isDirectory()) {
++            this.folder.mkdirs();
++        }
++
++        File[] files = this.folder.listFiles(RESOURCEPACK_FILTER);
++        if (files != null) {
++            for(File file : files) {
++                String string = "file/" + file.getName();
++                Pack pack = Pack.create(string, false, this.createSupplier(file), factory, Pack.Position.TOP, this.packSource);
++                if (pack != null) {
++                    profileAdder.accept(pack);
++                }
++            }
++
++        }
++    }
++
++    private Supplier<PackResources> createSupplier(File file) {
++        return file.isDirectory() ? () -> {
++            return new FolderPackResources(file);
++        } : () -> {
++            return new FilePackResources(file);
++        };
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/packs/repository/ServerPacksSource.java b/src/main/java/net/minecraft/server/packs/repository/ServerPacksSource.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..84b12b7cc6d9382be85279ddf38b2b167c25be21
+--- /dev/null
++++ b/src/main/java/net/minecraft/server/packs/repository/ServerPacksSource.java
+@@ -0,0 +1,27 @@
++package net.minecraft.server.packs.repository;
++
++import java.util.function.Consumer;
++
++import dev.cobblesword.skypaper.SkyPaper;
++import net.minecraft.SharedConstants;
++import net.minecraft.network.chat.TranslatableComponent;
++import net.minecraft.server.packs.PackType;
++import net.minecraft.server.packs.VanillaPackResources;
++import net.minecraft.server.packs.metadata.pack.PackMetadataSection;
++
++public class ServerPacksSource implements RepositorySource {
++    public static final PackMetadataSection BUILT_IN_METADATA = new PackMetadataSection(new TranslatableComponent("dataPack.vanilla.description"), PackType.SERVER_DATA.getVersion(SharedConstants.getCurrentVersion()));
++    public static final String VANILLA_ID = "vanilla";
++    private final VanillaPackResources vanillaPack = new VanillaPackResources(BUILT_IN_METADATA, "minecraft");
++
++    @Override
++    public void loadPacks(Consumer<Pack> profileAdder, Pack.PackConstructor factory) {
++        Pack pack = Pack.create("vanilla", false, () -> {
++            return this.vanillaPack;
++        }, factory, Pack.Position.BOTTOM, PackSource.BUILT_IN);
++        if (pack != null) {
++            profileAdder.accept(pack);
++        }
++
++    }
++}
+diff --git a/src/main/java/net/minecraft/util/worldupdate/WorldUpgrader.java b/src/main/java/net/minecraft/util/worldupdate/WorldUpgrader.java
+index b006519f2aacc84b45ab25e46d7b9112f9de816e..6291b5c58aa65b7cec4369b489c8b563ff731c67 100644
+--- a/src/main/java/net/minecraft/util/worldupdate/WorldUpgrader.java
++++ b/src/main/java/net/minecraft/util/worldupdate/WorldUpgrader.java
+@@ -1,299 +1,7 @@
+ package net.minecraft.util.worldupdate;
+ 
+-import com.google.common.collect.ImmutableList;
+-import com.google.common.collect.ImmutableMap;
+-import com.google.common.collect.ImmutableMap.Builder;
+-import com.google.common.collect.ImmutableSet;
+-import com.google.common.collect.Lists;
+-import com.google.common.collect.UnmodifiableIterator;
+-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+-import com.mojang.datafixers.DataFixer;
+-import it.unimi.dsi.fastutil.objects.Object2FloatMap;
+-import it.unimi.dsi.fastutil.objects.Object2FloatMaps;
+-import it.unimi.dsi.fastutil.objects.Object2FloatOpenCustomHashMap;
+-import java.io.File;
+-import java.io.IOException;
+-import java.util.List;
+-import java.util.ListIterator;
+-import java.util.concurrent.ThreadFactory;
+-import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+-import net.minecraft.ReportedException;
+-import net.minecraft.SharedConstants;
+-import net.minecraft.Util;
+-import net.minecraft.nbt.CompoundTag;
+-import net.minecraft.network.chat.Component;
+-import net.minecraft.network.chat.TranslatableComponent;
+-import net.minecraft.resources.ResourceKey;
+-import net.minecraft.world.level.ChunkPos;
+-import net.minecraft.world.level.Level;
+-import net.minecraft.world.level.chunk.storage.ChunkStorage;
+-import net.minecraft.world.level.chunk.storage.RegionFile;
+-import net.minecraft.world.level.dimension.DimensionType;
+-import net.minecraft.world.level.storage.DimensionDataStorage;
+-import net.minecraft.world.level.storage.LevelStorageSource;
+-import org.apache.logging.log4j.LogManager;
+-import org.apache.logging.log4j.Logger;
+ 
+ public class WorldUpgrader {
+-
+-    private static final Logger LOGGER = LogManager.getLogger();
+-    private static final ThreadFactory THREAD_FACTORY = (new ThreadFactoryBuilder()).setDaemon(true).build();
+-    private final ImmutableSet<ResourceKey<DimensionType>> levels; // CraftBukkit
+-    private final boolean eraseCache;
+-    private final LevelStorageSource.LevelStorageAccess levelStorage;
+-    private final Thread thread;
+-    private final DataFixer dataFixer;
+-    private volatile boolean running = true;
+-    private volatile boolean finished;
+-    private volatile float progress;
+-    private volatile int totalChunks;
+-    private volatile int converted;
+-    private volatile int skipped;
+-    private final Object2FloatMap<ResourceKey<DimensionType>> progressMap = Object2FloatMaps.synchronize(new Object2FloatOpenCustomHashMap(Util.identityStrategy())); // CraftBukkit
+-    private volatile Component status = new TranslatableComponent("optimizeWorld.stage.counting");
+     public static final Pattern REGEX = Pattern.compile("^r\\.(-?[0-9]+)\\.(-?[0-9]+)\\.mca$");
+-    private final DimensionDataStorage overworldDataStorage;
+-
+-    public WorldUpgrader(LevelStorageSource.LevelStorageAccess session, DataFixer dataFixer, ImmutableSet<ResourceKey<DimensionType>> worlds, boolean eraseCache) { // CraftBukkit
+-        this.levels = worlds;
+-        this.eraseCache = eraseCache;
+-        this.dataFixer = dataFixer;
+-        this.levelStorage = session;
+-        this.overworldDataStorage = new DimensionDataStorage(new File(this.levelStorage.getDimensionPath(Level.OVERWORLD), "data"), dataFixer);
+-        this.thread = WorldUpgrader.THREAD_FACTORY.newThread(this::work);
+-        this.thread.setUncaughtExceptionHandler((thread, throwable) -> {
+-            WorldUpgrader.LOGGER.error("Error upgrading world", throwable);
+-            this.status = new TranslatableComponent("optimizeWorld.stage.failed");
+-            this.finished = true;
+-        });
+-        this.thread.start();
+-    }
+-
+-    public void cancel() {
+-        this.running = false;
+-
+-        try {
+-            this.thread.join();
+-        } catch (InterruptedException interruptedexception) {
+-            ;
+-        }
+-
+-    }
+-
+-    private void work() {
+-        this.totalChunks = 0;
+-        Builder<ResourceKey<DimensionType>, ListIterator<ChunkPos>> builder = ImmutableMap.builder(); // CraftBukkit
+-
+-        List list;
+-
+-        for (UnmodifiableIterator unmodifiableiterator = this.levels.iterator(); unmodifiableiterator.hasNext(); this.totalChunks += list.size()) {
+-            ResourceKey<DimensionType> resourcekey = (ResourceKey) unmodifiableiterator.next(); // CraftBukkit
+-
+-            list = this.getAllChunkPos(resourcekey);
+-            builder.put(resourcekey, list.listIterator());
+-        }
+-
+-        if (this.totalChunks == 0) {
+-            this.finished = true;
+-        } else {
+-            float f = (float) this.totalChunks;
+-            ImmutableMap<ResourceKey<DimensionType>, ListIterator<ChunkPos>> immutablemap = builder.build(); // CraftBukkit
+-            Builder<ResourceKey<DimensionType>, ChunkStorage> builder1 = ImmutableMap.builder(); // CraftBukkit
+-            UnmodifiableIterator unmodifiableiterator1 = this.levels.iterator();
+-
+-            while (unmodifiableiterator1.hasNext()) {
+-                ResourceKey<DimensionType> resourcekey1 = (ResourceKey) unmodifiableiterator1.next(); // CraftBukkit
+-                File file = this.levelStorage.getDimensionPath((ResourceKey) null); // CraftBukkit
+-
+-                builder1.put(resourcekey1, new ChunkStorage(new File(file, "region"), this.dataFixer, true));
+-            }
+-
+-            ImmutableMap<ResourceKey<DimensionType>, ChunkStorage> immutablemap1 = builder1.build(); // CraftBukkit
+-            long i = Util.getMillis();
+-
+-            this.status = new TranslatableComponent("optimizeWorld.stage.upgrading");
+-
+-            while (this.running) {
+-                boolean flag = false;
+-                float f1 = 0.0F;
+-
+-                float f2;
+-
+-                for (UnmodifiableIterator unmodifiableiterator2 = this.levels.iterator(); unmodifiableiterator2.hasNext(); f1 += f2) {
+-                    ResourceKey<DimensionType> resourcekey2 = (ResourceKey) unmodifiableiterator2.next(); // CraftBukkit
+-                    ListIterator<ChunkPos> listiterator = (ListIterator) immutablemap.get(resourcekey2);
+-                    ChunkStorage ichunkloader = (ChunkStorage) immutablemap1.get(resourcekey2);
+-
+-                    if (listiterator.hasNext()) {
+-                        ChunkPos chunkcoordintpair = (ChunkPos) listiterator.next();
+-                        boolean flag1 = false;
+-
+-                        try {
+-                            CompoundTag nbttagcompound = ichunkloader.read(chunkcoordintpair);
+-
+-                            if (nbttagcompound != null) {
+-                                int j = ChunkStorage.getVersion(nbttagcompound);
+-                                CompoundTag nbttagcompound1 = ichunkloader.getChunkData(resourcekey2, () -> {
+-                                    return this.overworldDataStorage;
+-                                }, nbttagcompound, chunkcoordintpair, null); // CraftBukkit
+-                                CompoundTag nbttagcompound2 = nbttagcompound1.getCompound("Level");
+-                                ChunkPos chunkcoordintpair1 = new ChunkPos(nbttagcompound2.getInt("xPos"), nbttagcompound2.getInt("zPos"));
+-
+-                                if (!chunkcoordintpair1.equals(chunkcoordintpair)) {
+-                                    WorldUpgrader.LOGGER.warn("Chunk {} has invalid position {}", chunkcoordintpair, chunkcoordintpair1);
+-                                }
+-
+-                                boolean flag2 = j < SharedConstants.getCurrentVersion().getWorldVersion();
+-
+-                                if (this.eraseCache) {
+-                                    flag2 = flag2 || nbttagcompound2.contains("Heightmaps");
+-                                    nbttagcompound2.remove("Heightmaps");
+-                                    flag2 = flag2 || nbttagcompound2.contains("isLightOn");
+-                                    nbttagcompound2.remove("isLightOn");
+-                                }
+-
+-                                if (flag2) {
+-                                    ichunkloader.write(chunkcoordintpair, nbttagcompound1);
+-                                    flag1 = true;
+-                                }
+-                            }
+-                        } catch (ReportedException reportedexception) {
+-                            Throwable throwable = reportedexception.getCause();
+-
+-                            if (!(throwable instanceof IOException)) {
+-                                throw reportedexception;
+-                            }
+-
+-                            WorldUpgrader.LOGGER.error("Error upgrading chunk {}", chunkcoordintpair, throwable);
+-                        } catch (IOException ioexception) {
+-                            WorldUpgrader.LOGGER.error("Error upgrading chunk {}", chunkcoordintpair, ioexception);
+-                        }
+-
+-                        if (flag1) {
+-                            ++this.converted;
+-                        } else {
+-                            ++this.skipped;
+-                        }
+-
+-                        flag = true;
+-                    }
+-
+-                    f2 = (float) listiterator.nextIndex() / f;
+-                    this.progressMap.put(resourcekey2, f2);
+-                }
+-
+-                this.progress = f1;
+-                if (!flag) {
+-                    this.running = false;
+-                }
+-            }
+-
+-            this.status = new TranslatableComponent("optimizeWorld.stage.finished");
+-            UnmodifiableIterator unmodifiableiterator3 = immutablemap1.values().iterator();
+-
+-            while (unmodifiableiterator3.hasNext()) {
+-                ChunkStorage ichunkloader1 = (ChunkStorage) unmodifiableiterator3.next();
+-
+-                try {
+-                    ichunkloader1.close();
+-                } catch (IOException ioexception1) {
+-                    WorldUpgrader.LOGGER.error("Error upgrading chunk", ioexception1);
+-                }
+-            }
+-
+-            this.overworldDataStorage.save();
+-            i = Util.getMillis() - i;
+-            WorldUpgrader.LOGGER.info("World optimizaton finished after {} ms", i);
+-            this.finished = true;
+-        }
+-    }
+-
+-    private List<ChunkPos> getAllChunkPos(ResourceKey<DimensionType> world) { // CraftBukkit
+-        File file = this.levelStorage.getDimensionPath((ResourceKey) null); // CraftBukkit
+-        File file1 = new File(file, "region");
+-        File[] afile = file1.listFiles((file2, s) -> {
+-            return s.endsWith(".mca");
+-        });
+-
+-        if (afile == null) {
+-            return ImmutableList.of();
+-        } else {
+-            List<ChunkPos> list = Lists.newArrayList();
+-            File[] afile1 = afile;
+-            int i = afile.length;
+-
+-            for (int j = 0; j < i; ++j) {
+-                File file2 = afile1[j];
+-                Matcher matcher = WorldUpgrader.REGEX.matcher(file2.getName());
+-
+-                if (matcher.matches()) {
+-                    int k = Integer.parseInt(matcher.group(1)) << 5;
+-                    int l = Integer.parseInt(matcher.group(2)) << 5;
+-
+-                    try {
+-                        RegionFile regionfile = new RegionFile(file2, file1, true);
+-
+-                        try {
+-                            for (int i1 = 0; i1 < 32; ++i1) {
+-                                for (int j1 = 0; j1 < 32; ++j1) {
+-                                    ChunkPos chunkcoordintpair = new ChunkPos(i1 + k, j1 + l);
+-
+-                                    if (regionfile.doesChunkExist(chunkcoordintpair)) {
+-                                        list.add(chunkcoordintpair);
+-                                    }
+-                                }
+-                            }
+-                        } catch (Throwable throwable) {
+-                            try {
+-                                regionfile.close();
+-                            } catch (Throwable throwable1) {
+-                                throwable.addSuppressed(throwable1);
+-                            }
+-
+-                            throw throwable;
+-                        }
+-
+-                        regionfile.close();
+-                    } catch (Throwable throwable2) {
+-                        ;
+-                    }
+-                }
+-            }
+-
+-            return list;
+-        }
+-    }
+-
+-    public boolean isFinished() {
+-        return this.finished;
+-    }
+-
+-    public ImmutableSet<ResourceKey<Level>> levels() {
+-        throw new AssertionError("Unsupported"); // CraftBukkit
+-    }
+-
+-    public float dimensionProgress(ResourceKey<Level> world) {
+-        return this.progressMap.getFloat(world);
+-    }
+-
+-    public float getProgress() {
+-        return this.progress;
+-    }
+-
+-    public int getTotalChunks() {
+-        return this.totalChunks;
+-    }
+-
+-    public int getConverted() {
+-        return this.converted;
+-    }
+-
+-    public int getSkipped() {
+-        return this.skipped;
+-    }
+-
+-    public Component getStatus() {
+-        return this.status;
+-    }
+ }
+diff --git a/src/main/java/net/minecraft/world/entity/ai/village/poi/PoiManager.java b/src/main/java/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+index 2b79ace854461b216dc4970d1cc4a3953a51dd50..6bef76f87fcd14ba88d067d0bde93d84c133f474 100644
+--- a/src/main/java/net/minecraft/world/entity/ai/village/poi/PoiManager.java
++++ b/src/main/java/net/minecraft/world/entity/ai/village/poi/PoiManager.java
+@@ -39,8 +39,8 @@ public class PoiManager extends SectionStorage<PoiSection> {
+     private final LongSet loadedChunks = new LongOpenHashSet();
+     public final net.minecraft.server.level.ServerLevel world; // Paper // Paper public
+ 
+-    public PoiManager(File directory, DataFixer dataFixer, boolean dsync, LevelHeightAccessor world) {
+-        super(directory, PoiSection::codec, PoiSection::new, dataFixer, DataFixTypes.POI_CHUNK, dsync, world);
++    public PoiManager(int worldDatabaseId, File directory, DataFixer dataFixer, boolean dsync, LevelHeightAccessor world) {
++        super(worldDatabaseId, directory, PoiSection::codec, PoiSection::new, dataFixer, DataFixTypes.POI_CHUNK, dsync, world);
+         this.world = (net.minecraft.server.level.ServerLevel)world; // Paper
+         this.distanceTracker = new PoiManager.DistanceTracker();
+     }
+diff --git a/src/main/java/net/minecraft/world/level/chunk/storage/ChunkStorage.java b/src/main/java/net/minecraft/world/level/chunk/storage/ChunkStorage.java
+index 747e2a31f055d84d4321c8241e1b6c2918557e91..5bf8ae8369c26c56b1dfc253a9e5e2e6c098bcd2 100644
+--- a/src/main/java/net/minecraft/world/level/chunk/storage/ChunkStorage.java
++++ b/src/main/java/net/minecraft/world/level/chunk/storage/ChunkStorage.java
+@@ -30,11 +30,11 @@ public class ChunkStorage implements AutoCloseable {
+     public final RegionFileStorage regionFileCache;
+     // Paper end - async chunk loading
+ 
+-    public ChunkStorage(File directory, DataFixer dataFixer, boolean dsync) {
++    public ChunkStorage(int worldDatabaseId, File directory, DataFixer dataFixer, boolean dsync) {
+         this.fixerUpper = dataFixer;
+         // Paper start - async chunk io
+         // remove IO worker
+-        this.regionFileCache = new RegionFileStorage(directory, dsync, true); // Paper - nuke IOWorker // Paper
++        this.regionFileCache = new RegionFileStorage(worldDatabaseId, directory, dsync, true); // Paper - nuke IOWorker // Paper
+         // Paper end - async chunk io
+     }
+ 
+diff --git a/src/main/java/net/minecraft/world/level/chunk/storage/EntityStorage.java b/src/main/java/net/minecraft/world/level/chunk/storage/EntityStorage.java
+index 916f93b097a65f95e830fe5e1567c85d304f808f..60278d391440f03c82f53a3d726c6be50a8a7d12 100644
+--- a/src/main/java/net/minecraft/world/level/chunk/storage/EntityStorage.java
++++ b/src/main/java/net/minecraft/world/level/chunk/storage/EntityStorage.java
+@@ -43,7 +43,7 @@ public class EntityStorage implements EntityPersistentStorage<Entity> {
+         this.level = world;
+         this.fixerUpper = dataFixer;
+         this.entityDeserializerQueue = ProcessorMailbox.create(executor, "entity-deserializer");
+-        this.worker = new IOWorker(chunkFile, dsync, "entities");
++        this.worker = new IOWorker(this.level.databaseId, chunkFile, dsync, "entities");
+     }
+ 
+     @Override
+diff --git a/src/main/java/net/minecraft/world/level/chunk/storage/IOWorker.java b/src/main/java/net/minecraft/world/level/chunk/storage/IOWorker.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f0e76521e93a3663f6f293f300c3dafe86243a6
+--- /dev/null
++++ b/src/main/java/net/minecraft/world/level/chunk/storage/IOWorker.java
+@@ -0,0 +1,175 @@
++package net.minecraft.world.level.chunk.storage;
++
++import com.google.common.collect.Maps;
++import com.mojang.datafixers.util.Either;
++import java.io.File;
++import java.io.IOException;
++import java.util.Iterator;
++import java.util.Map;
++import java.util.Map.Entry;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.CompletionException;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.function.Function;
++import java.util.function.Supplier;
++import javax.annotation.Nullable;
++import net.minecraft.Util;
++import net.minecraft.nbt.CompoundTag;
++import net.minecraft.util.Unit;
++import net.minecraft.util.thread.ProcessorMailbox;
++import net.minecraft.util.thread.StrictQueue;
++import net.minecraft.world.level.ChunkPos;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++public class IOWorker implements AutoCloseable {
++    private static final Logger LOGGER = LogManager.getLogger();
++    private final AtomicBoolean shutdownRequested = new AtomicBoolean();
++    private final ProcessorMailbox<StrictQueue.IntRunnable> mailbox;
++    private final RegionFileStorage storage;
++    private final Map<ChunkPos, IOWorker.PendingStore> pendingWrites = Maps.newLinkedHashMap();
++
++    protected IOWorker(int worldDatabaseId, File directory, boolean dsync, String name) {
++        this.storage = new RegionFileStorage(worldDatabaseId, directory, dsync);
++        this.mailbox = new ProcessorMailbox<>(new StrictQueue.FixedPriorityQueue(IOWorker.Priority.values().length), Util.ioPool(), "IOWorker-" + name);
++    }
++
++    public CompletableFuture<Void> store(ChunkPos pos, @Nullable CompoundTag nbt) {
++        return this.submitTask(() -> {
++            IOWorker.PendingStore pendingStore = this.pendingWrites.computeIfAbsent(pos, (chunkPos) -> {
++                return new IOWorker.PendingStore(nbt);
++            });
++            pendingStore.data = nbt;
++            return Either.left(pendingStore.result);
++        }).thenCompose(Function.identity());
++    }
++
++    @Nullable
++    public CompoundTag load(ChunkPos pos) throws IOException {
++        CompletableFuture<CompoundTag> completableFuture = this.loadAsync(pos);
++
++        try {
++            return completableFuture.join();
++        } catch (CompletionException var4) {
++            if (var4.getCause() instanceof IOException) {
++                throw (IOException)var4.getCause();
++            } else {
++                throw var4;
++            }
++        }
++    }
++
++    protected CompletableFuture<CompoundTag> loadAsync(ChunkPos pos) {
++        return this.submitTask(() -> {
++            IOWorker.PendingStore pendingStore = this.pendingWrites.get(pos);
++            if (pendingStore != null) {
++                return Either.left(pendingStore.data);
++            } else {
++                try {
++                    CompoundTag compoundTag = this.storage.read(pos);
++                    return Either.left(compoundTag);
++                } catch (Exception var4) {
++                    LOGGER.warn("Failed to read chunk {}", pos, var4);
++                    return Either.right(var4);
++                }
++            }
++        });
++    }
++
++    public CompletableFuture<Void> synchronize(boolean bl) {
++        CompletableFuture<Void> completableFuture = this.submitTask(() -> {
++            return Either.left(CompletableFuture.allOf(this.pendingWrites.values().stream().map((pendingStore) -> {
++                return pendingStore.result;
++            }).toArray((i) -> {
++                return new CompletableFuture[i];
++            })));
++        }).thenCompose(Function.identity());
++        return bl ? completableFuture.thenCompose((void_) -> {
++            return this.submitTask(() -> {
++                try {
++                    this.storage.flush();
++                    return Either.left((Void)null);
++                } catch (Exception var2) {
++                    LOGGER.warn("Failed to synchronize chunks", (Throwable)var2);
++                    return Either.right(var2);
++                }
++            });
++        }) : completableFuture.thenCompose((void_) -> {
++            return this.submitTask(() -> {
++                return Either.left((Void)null);
++            });
++        });
++    }
++
++    private <T> CompletableFuture<T> submitTask(Supplier<Either<T, Exception>> task) {
++        return this.mailbox.askEither((processorHandle) -> {
++            return new StrictQueue.IntRunnable(IOWorker.Priority.FOREGROUND.ordinal(), () -> {
++                if (!this.shutdownRequested.get()) {
++                    processorHandle.tell(task.get());
++                }
++
++                this.tellStorePending();
++            });
++        });
++    }
++
++    private void storePendingChunk() {
++        if (!this.pendingWrites.isEmpty()) {
++            Iterator<Entry<ChunkPos, IOWorker.PendingStore>> iterator = this.pendingWrites.entrySet().iterator();
++            Entry<ChunkPos, IOWorker.PendingStore> entry = iterator.next();
++            iterator.remove();
++            this.runStore(entry.getKey(), entry.getValue());
++            this.tellStorePending();
++        }
++    }
++
++    private void tellStorePending() {
++        this.mailbox.tell(new StrictQueue.IntRunnable(IOWorker.Priority.BACKGROUND.ordinal(), this::storePendingChunk));
++    }
++
++    private void runStore(ChunkPos pos, IOWorker.PendingStore result) {
++        try {
++            this.storage.write(pos, result.data);
++            result.result.complete((Void)null);
++        } catch (Exception var4) {
++            LOGGER.error("Failed to store chunk {}", pos, var4);
++            result.result.completeExceptionally(var4);
++        }
++
++    }
++
++    @Override
++    public void close() throws IOException {
++        if (this.shutdownRequested.compareAndSet(false, true)) {
++            this.mailbox.ask((processorHandle) -> {
++                return new StrictQueue.IntRunnable(IOWorker.Priority.SHUTDOWN.ordinal(), () -> {
++                    processorHandle.tell(Unit.INSTANCE);
++                });
++            }).join();
++            this.mailbox.close();
++
++            try {
++                this.storage.close();
++            } catch (Exception var2) {
++                LOGGER.error("Failed to close storage", (Throwable)var2);
++            }
++
++        }
++    }
++
++    static class PendingStore {
++        @Nullable
++        CompoundTag data;
++        final CompletableFuture<Void> result = new CompletableFuture<>();
++
++        public PendingStore(@Nullable CompoundTag nbt) {
++            this.data = nbt;
++        }
++    }
++
++    static enum Priority {
++        FOREGROUND,
++        BACKGROUND,
++        SHUTDOWN;
++    }
++}
+diff --git a/src/main/java/net/minecraft/world/level/chunk/storage/RegionFileStorage.java b/src/main/java/net/minecraft/world/level/chunk/storage/RegionFileStorage.java
+index 4e0006b73fbd2634aa42334ae9dde79b4eccaf38..4ea94d5c661fc16b1012090e734a8dba63ba8f9a 100644
+--- a/src/main/java/net/minecraft/world/level/chunk/storage/RegionFileStorage.java
++++ b/src/main/java/net/minecraft/world/level/chunk/storage/RegionFileStorage.java
+@@ -1,5 +1,6 @@
+ package net.minecraft.world.level.chunk.storage;
+ 
++import dev.cobblesword.skypaper.SkyPaper;
+ import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap;
+ import it.unimi.dsi.fastutil.objects.ObjectIterator;
+ import java.io.DataInput;
+@@ -24,18 +25,20 @@ public class RegionFileStorage implements AutoCloseable {
+     public final Long2ObjectLinkedOpenHashMap<RegionFile> regionCache = new Long2ObjectLinkedOpenHashMap();
+     private final File folder;
+     private final boolean sync;
++    private int worldDatabaseId;
+ 
+     private final boolean isChunkData; // Paper
+ 
+-    RegionFileStorage(File directory, boolean dsync) {
++    RegionFileStorage(int worldDatabaseId, File directory, boolean dsync) {
+         // Paper start - add isChunkData param
+-        this(directory, dsync, false);
++        this(worldDatabaseId, directory, dsync, false);
+     }
+-    RegionFileStorage(File directory, boolean dsync, boolean isChunkData) {
++    RegionFileStorage(int worldDatabaseId, File directory, boolean dsync, boolean isChunkData) {
+         this.isChunkData = isChunkData;
+         // Paper end - add isChunkData param
+         this.folder = directory;
+         this.sync = dsync;
++        this.worldDatabaseId = worldDatabaseId;
+     }
+ 
+     // Paper start
+@@ -182,14 +185,17 @@ public class RegionFileStorage implements AutoCloseable {
+     // Paper End
+ 
+     @Nullable
+-    public CompoundTag read(ChunkPos pos) throws IOException {
+-        // CraftBukkit start - SPIGOT-5680: There's no good reason to preemptively create files on read, save that for writing
+-        RegionFile regionfile = this.getFile(pos, true, true); // Paper
+-        if (regionfile == null) {
+-            return null;
+-        }
+-        // Paper start - Add regionfile parameter
+-        return this.read(pos, regionfile);
++    public CompoundTag read(ChunkPos pos) throws IOException
++    {
++        String dataType = this.folder.getName();
++        return SkyPaper.INSTANCE.getWorldChunkDao().loadWorldChunk(dataType, this.worldDatabaseId, pos);
++//        // CraftBukkit start - SPIGOT-5680: There's no good reason to preemptively create files on read, save that for writing
++//        RegionFile regionfile = this.getFile(pos, true, true); // Paper
++//        if (regionfile == null) {
++//            return null;
++//        }
++//        // Paper start - Add regionfile parameter
++//        return this.read(pos, regionfile);
+     }
+     public CompoundTag read(ChunkPos pos, RegionFile regionfile) throws IOException {
+         // We add the regionfile parameter to avoid the potential deadlock (on fileLock) if we went back to obtain a regionfile
+@@ -256,51 +262,55 @@ public class RegionFileStorage implements AutoCloseable {
+     }
+ 
+     protected void write(ChunkPos pos, @Nullable CompoundTag nbt) throws IOException {
+-        RegionFile regionfile = this.getFile(pos, false, true); // CraftBukkit // Paper
+-        try { // Paper
+-        int attempts = 0; Exception laste = null; while (attempts++ < 5) { try { // Paper
+-
+-        if (nbt == null) {
+-            regionfile.clear(pos);
+-        } else {
+-            DataOutputStream dataoutputstream = regionfile.getChunkDataOutputStream(pos);
+-
+-            try {
+-                NbtIo.write(nbt, (DataOutput) dataoutputstream);
+-                regionfile.setStatus(pos.x, pos.z, ChunkSerializer.getStatus(nbt)); // Paper - cache status on disk
+-                regionfile.setOversized(pos.x, pos.z, false); // Paper - We don't do this anymore, mojang stores differently, but clear old meta flag if it exists to get rid of our own meta file once last oversized is gone
+-            } catch (Throwable throwable) {
+-                if (dataoutputstream != null) {
+-                    try {
+-                        dataoutputstream.close();
+-                    } catch (Throwable throwable1) {
+-                        throwable.addSuppressed(throwable1);
+-                    }
+-                }
+-
+-                throw throwable;
+-            }
+-
+-            if (dataoutputstream != null) {
+-                dataoutputstream.close();
+-            }
+-        }
+-
+-            // Paper start
+-            return;
+-        } catch (Exception ex)  {
+-            laste = ex;
+-        }
+-        }
+-
+-        if (laste != null) {
+-            com.destroystokyo.paper.exception.ServerInternalException.reportInternalException(laste);
+-            MinecraftServer.LOGGER.error("Failed to save chunk", laste);
+-        }
+-        // Paper end
+-        } finally { // Paper start
+-            regionfile.fileLock.unlock();
+-        } // Paper end
++        String dataType = this.folder.getName();
++        SkyPaper.INSTANCE.getWorldChunkDao().saveWorldChunk(dataType, this.worldDatabaseId, pos, nbt);
++
++//
++//        RegionFile regionfile = this.getFile(pos, false, true); // CraftBukkit // Paper
++//        try { // Paper
++//        int attempts = 0; Exception laste = null; while (attempts++ < 5) { try { // Paper
++//
++//        if (nbt == null) {
++//            regionfile.clear(pos);
++//        } else {
++//            DataOutputStream dataoutputstream = regionfile.getChunkDataOutputStream(pos);
++//
++//            try {
++//                NbtIo.write(nbt, (DataOutput) dataoutputstream);
++//                regionfile.setStatus(pos.x, pos.z, ChunkSerializer.getStatus(nbt)); // Paper - cache status on disk
++//                regionfile.setOversized(pos.x, pos.z, false); // Paper - We don't do this anymore, mojang stores differently, but clear old meta flag if it exists to get rid of our own meta file once last oversized is gone
++//            } catch (Throwable throwable) {
++//                if (dataoutputstream != null) {
++//                    try {
++//                        dataoutputstream.close();
++//                    } catch (Throwable throwable1) {
++//                        throwable.addSuppressed(throwable1);
++//                    }
++//                }
++//
++//                throw throwable;
++//            }
++//
++//            if (dataoutputstream != null) {
++//                dataoutputstream.close();
++//            }
++//        }
++//
++//            // Paper start
++//            return;
++//        } catch (Exception ex)  {
++//            laste = ex;
++//        }
++//        }
++//
++//        if (laste != null) {
++//            com.destroystokyo.paper.exception.ServerInternalException.reportInternalException(laste);
++//            MinecraftServer.LOGGER.error("Failed to save chunk", laste);
++//        }
++//        // Paper end
++//        } finally { // Paper start
++//            regionfile.fileLock.unlock();
++//        } // Paper end
+     }
+ 
+     public synchronized void close() throws IOException { // Paper -> synchronized
+diff --git a/src/main/java/net/minecraft/world/level/chunk/storage/SectionStorage.java b/src/main/java/net/minecraft/world/level/chunk/storage/SectionStorage.java
+index a7a51aa31628d9dbc30f43ef74022b0cd917be7c..bd02fe9559cf0dafa3ef57eb222f77153620e317 100644
+--- a/src/main/java/net/minecraft/world/level/chunk/storage/SectionStorage.java
++++ b/src/main/java/net/minecraft/world/level/chunk/storage/SectionStorage.java
+@@ -42,8 +42,8 @@ public class SectionStorage<R> extends RegionFileStorage implements AutoCloseabl
+     private final DataFixTypes type;
+     protected final LevelHeightAccessor levelHeightAccessor;
+ 
+-    public SectionStorage(File directory, Function<Runnable, Codec<R>> codecFactory, Function<Runnable, R> factory, DataFixer dataFixer, DataFixTypes dataFixTypes, boolean dsync, LevelHeightAccessor world) {
+-        super(directory, dsync); // Paper - nuke IOWorker
++    public SectionStorage(int worldDatabaseId, File directory, Function<Runnable, Codec<R>> codecFactory, Function<Runnable, R> factory, DataFixer dataFixer, DataFixTypes dataFixTypes, boolean dsync, LevelHeightAccessor world) {
++        super(worldDatabaseId, directory, dsync); // Paper - nuke IOWorker
+         this.codec = codecFactory;
+         this.factory = factory;
+         this.fixerUpper = dataFixer;
+diff --git a/src/main/java/net/minecraft/world/level/saveddata/SavedData.java b/src/main/java/net/minecraft/world/level/saveddata/SavedData.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c14bdcd57aa8fd4b6b1520761d2bbe977d5dfd1
+--- /dev/null
++++ b/src/main/java/net/minecraft/world/level/saveddata/SavedData.java
+@@ -0,0 +1,42 @@
++package net.minecraft.world.level.saveddata;
++
++import java.io.File;
++import java.io.IOException;
++
++import dev.cobblesword.skypaper.SkyPaper;
++import net.minecraft.SharedConstants;
++import net.minecraft.nbt.CompoundTag;
++import net.minecraft.nbt.NbtIo;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++
++public abstract class SavedData {
++    private static final Logger LOGGER = LogManager.getLogger();
++    private boolean dirty;
++
++    public abstract CompoundTag save(CompoundTag nbt);
++
++    public void setDirty() {
++        this.setDirty(true);
++    }
++
++    public void setDirty(boolean dirty) {
++        this.dirty = dirty;
++    }
++
++    public boolean isDirty() {
++        return this.dirty;
++    }
++
++    public void save(int worldDatabaseId, File file) {
++        if (this.isDirty()) {
++            CompoundTag compoundTag = new CompoundTag();
++            compoundTag.put("data", this.save(new CompoundTag()));
++            compoundTag.putInt("DataVersion", SharedConstants.getCurrentVersion().getWorldVersion());
++
++            SkyPaper.INSTANCE.getWorldDataCacheDao().saveWorldDataCache(worldDatabaseId, file.getName(), compoundTag);
++
++            this.setDirty(false);
++        }
++    }
++}
+diff --git a/src/main/java/net/minecraft/world/level/saveddata/maps/MapItemSavedData.java b/src/main/java/net/minecraft/world/level/saveddata/maps/MapItemSavedData.java
+index 60d7496966b22e0553372a93e3c0e7ed9e166cba..5c7c167f80edc1f30e344456c9658b6f99718d39 100644
+--- a/src/main/java/net/minecraft/world/level/saveddata/maps/MapItemSavedData.java
++++ b/src/main/java/net/minecraft/world/level/saveddata/maps/MapItemSavedData.java
+@@ -42,7 +42,6 @@ import org.bukkit.Bukkit;
+ import org.bukkit.craftbukkit.CraftServer;
+ import org.bukkit.craftbukkit.CraftWorld;
+ import org.bukkit.craftbukkit.map.CraftMapView;
+-import org.bukkit.craftbukkit.util.CraftChatMessage;
+ // CraftBukkit end
+ 
+ public class MapItemSavedData extends SavedData {
+diff --git a/src/main/java/net/minecraft/world/level/storage/DimensionDataStorage.java b/src/main/java/net/minecraft/world/level/storage/DimensionDataStorage.java
+index c8ed0673ff819cb88d0ee6f53f2a2b9b46b203d4..75126ea1f387cf65dd0e7fe639b178676dae279e 100644
+--- a/src/main/java/net/minecraft/world/level/storage/DimensionDataStorage.java
++++ b/src/main/java/net/minecraft/world/level/storage/DimensionDataStorage.java
+@@ -2,20 +2,17 @@ package net.minecraft.world.level.storage;
+ 
+ import com.google.common.collect.Maps;
+ import com.mojang.datafixers.DataFixer;
+-import java.io.DataInputStream;
++
+ import java.io.File;
+-import java.io.FileInputStream;
+ import java.io.IOException;
+-import java.io.PushbackInputStream;
+ import java.util.Map;
+ import java.util.function.Function;
+ import java.util.function.Supplier;
+ import javax.annotation.Nullable;
++
++import dev.cobblesword.skypaper.SkyPaper;
+ import net.minecraft.SharedConstants;
+ import net.minecraft.nbt.CompoundTag;
+-import net.minecraft.nbt.NbtIo;
+-import net.minecraft.nbt.NbtUtils;
+-import net.minecraft.util.datafix.DataFixTypes;
+ import net.minecraft.world.level.saveddata.SavedData;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+@@ -25,8 +22,10 @@ public class DimensionDataStorage {
+     public final Map<String, SavedData> cache = Maps.newHashMap();
+     private final DataFixer fixerUpper;
+     private final File dataFolder;
++    private int worldDatabaseId;
+ 
+-    public DimensionDataStorage(File directory, DataFixer dataFixer) {
++    public DimensionDataStorage(int databaseId, File directory, DataFixer dataFixer) {
++        this.worldDatabaseId = databaseId;
+         this.fixerUpper = dataFixer;
+         this.dataFolder = directory;
+     }
+@@ -60,11 +59,12 @@ public class DimensionDataStorage {
+     @Nullable
+     private <T extends SavedData> T readSavedData(Function<CompoundTag, T> function, String id) {
+         try {
+-            File file = this.getDataFile(id);
+-            if (file.exists()) {
+-                CompoundTag compoundTag = this.readTagFromDisk(id, SharedConstants.getCurrentVersion().getWorldVersion());
+-                return function.apply(compoundTag.getCompound("data"));
++            CompoundTag compoundTag = this.readTagFromDisk(id, SharedConstants.getCurrentVersion().getWorldVersion());
++            if(compoundTag == null)
++            {
++                return null;
+             }
++            return function.apply(compoundTag.getCompound("data"));
+         } catch (Exception var5) {
+             LOGGER.error("Error loading saved data: {}", id, var5);
+         }
+@@ -76,88 +76,19 @@ public class DimensionDataStorage {
+         this.cache.put(string, savedData);
+     }
+ 
+-    public CompoundTag readTagFromDisk(String id, int dataVersion) throws IOException {
++    public CompoundTag readTagFromDisk(String id, int dataVersion) throws IOException
++    {
+         File file = this.getDataFile(id);
+-        FileInputStream fileInputStream = new FileInputStream(file);
+-
+-        CompoundTag var8;
+-        try {
+-            PushbackInputStream pushbackInputStream = new PushbackInputStream(fileInputStream, 2);
+-
+-            try {
+-                CompoundTag compoundTag;
+-                if (this.isGzip(pushbackInputStream)) {
+-                    compoundTag = NbtIo.readCompressed(pushbackInputStream);
+-                } else {
+-                    DataInputStream dataInputStream = new DataInputStream(pushbackInputStream);
+-
+-                    try {
+-                        compoundTag = NbtIo.read(dataInputStream);
+-                    } catch (Throwable var13) {
+-                        try {
+-                            dataInputStream.close();
+-                        } catch (Throwable var12) {
+-                            var13.addSuppressed(var12);
+-                        }
+-
+-                        throw var13;
+-                    }
+-
+-                    dataInputStream.close();
+-                }
+-
+-                int i = compoundTag.contains("DataVersion", 99) ? compoundTag.getInt("DataVersion") : 1343;
+-                var8 = NbtUtils.update(this.fixerUpper, DataFixTypes.SAVED_DATA, compoundTag, i, dataVersion);
+-            } catch (Throwable var14) {
+-                try {
+-                    pushbackInputStream.close();
+-                } catch (Throwable var11) {
+-                    var14.addSuppressed(var11);
+-                }
+-
+-                throw var14;
+-            }
+-
+-            pushbackInputStream.close();
+-        } catch (Throwable var15) {
+-            com.destroystokyo.paper.exception.ServerInternalException.reportInternalException(var15); // Paper
+-            try {
+-                fileInputStream.close();
+-            } catch (Throwable var10) {
+-                var15.addSuppressed(var10);
+-            }
+-
+-            throw var15;
+-        }
+-
+-        fileInputStream.close();
+-        return var8;
+-    }
+-
+-    private boolean isGzip(PushbackInputStream pushbackInputStream) throws IOException {
+-        byte[] bs = new byte[2];
+-        boolean bl = false;
+-        int i = pushbackInputStream.read(bs, 0, 2);
+-        if (i == 2) {
+-            int j = (bs[1] & 255) << 8 | bs[0] & 255;
+-            if (j == 35615) {
+-                bl = true;
+-            }
+-        }
+-
+-        if (i != 0) {
+-            pushbackInputStream.unread(bs, 0, i);
+-        }
+-
+-        return bl;
++        return SkyPaper.INSTANCE.getWorldDataCacheDao().loadWorldDataCache(this.worldDatabaseId, file.getName());
+     }
+ 
+-    public void save() {
+-        this.cache.forEach((string, savedData) -> {
++    public void save()
++    {
++        this.cache.forEach((string, savedData) ->
++        {
+             if (savedData != null) {
+-                savedData.save(this.getDataFile(string));
++                savedData.save(this.worldDatabaseId, this.getDataFile(string));
+             }
+-
+         });
+     }
+ }
+diff --git a/src/main/java/net/minecraft/world/level/storage/LevelStorageSource.java b/src/main/java/net/minecraft/world/level/storage/LevelStorageSource.java
+index b794c02ea36bdc901b1f6a160095abb3fcfe9b60..77d66864183b5d62446c0f00abac4d37a7dff9c9 100644
+--- a/src/main/java/net/minecraft/world/level/storage/LevelStorageSource.java
++++ b/src/main/java/net/minecraft/world/level/storage/LevelStorageSource.java
+@@ -33,6 +33,8 @@ import java.util.function.BiFunction;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipOutputStream;
+ import javax.annotation.Nullable;
++
++import dev.cobblesword.skypaper.SkyPaper;
+ import net.minecraft.FileUtil;
+ import net.minecraft.SharedConstants;
+ import net.minecraft.Util;
+@@ -193,28 +195,24 @@ public class LevelStorageSource {
+ 
+     @Nullable
+     <T> T readLevelData(File file, BiFunction<File, DataFixer, T> levelDataParser) {
+-        if (!file.exists()) {
+-            return null;
+-        } else {
+-            File file1 = new File(file, "level.dat");
++        T t0 = levelDataParser.apply(file, this.fixerUpper);
+ 
+-            if (file1.exists()) {
+-                T t0 = levelDataParser.apply(file1, this.fixerUpper);
+-
+-                if (t0 != null) {
+-                    return t0;
+-                }
+-            }
+-
+-            file1 = new File(file, "level.dat_old");
+-            return file1.exists() ? levelDataParser.apply(file1, this.fixerUpper) : null;
++        if (t0 != null) {
++            return t0;
+         }
++
++        return null;
+     }
+ 
+     @Nullable
+     private static DataPackConfig getDataPacks(File file, DataFixer datafixer) {
+         try {
+-            CompoundTag nbttagcompound = NbtIo.readCompressed(file);
++            CompoundTag nbttagcompound = SkyPaper.INSTANCE.getWorldDao().loadWorldData(file.getName());
++            if(nbttagcompound == null)
++            {
++                // don't generate world
++                return null;
++            }
+             CompoundTag nbttagcompound1 = nbttagcompound.getCompound("Data");
+ 
+             nbttagcompound1.remove("Player");
+@@ -231,7 +229,13 @@ public class LevelStorageSource {
+     static BiFunction<File, DataFixer, PrimaryLevelData> getLevelData(DynamicOps<Tag> dynamicops, DataPackConfig datapackconfiguration) {
+         return (file, datafixer) -> {
+             try {
+-                CompoundTag nbttagcompound = NbtIo.readCompressed(file);
++                CompoundTag nbttagcompound = SkyPaper.INSTANCE.getWorldDao().loadWorldData(file.getName());
++                if(nbttagcompound == null)
++                {
++                    // world not generated
++                    return null;
++                }
++
+                 CompoundTag nbttagcompound1 = nbttagcompound.getCompound("Data");
+                 CompoundTag nbttagcompound2 = nbttagcompound1.contains("Player", 10) ? nbttagcompound1.getCompound("Player") : null;
+ 
+@@ -253,7 +257,13 @@ public class LevelStorageSource {
+     BiFunction<File, DataFixer, LevelSummary> levelSummaryReader(File file, boolean locked) {
+         return (file1, datafixer) -> {
+             try {
+-                CompoundTag nbttagcompound = NbtIo.readCompressed(file1);
++                CompoundTag nbttagcompound = SkyPaper.INSTANCE.getWorldDao().loadWorldData(file.getName());
++                if(nbttagcompound == null)
++                {
++                    // no world found
++                    return null;
++                }
++
+                 CompoundTag nbttagcompound1 = nbttagcompound.getCompound("Data");
+ 
+                 nbttagcompound1.remove("Player");
+@@ -322,8 +332,6 @@ public class LevelStorageSource {
+     // CraftBukkit end
+ 
+     public class LevelStorageAccess implements AutoCloseable {
+-
+-        final DirectoryLock lock;
+         public final Path levelPath;
+         private final String levelId;
+         private final Map<LevelResource, Path> resources = Maps.newHashMap();
+@@ -335,7 +343,6 @@ public class LevelStorageSource {
+             // CraftBukkit end
+             this.levelId = s;
+             this.levelPath = LevelStorageSource.this.baseDir.resolve(s);
+-            this.lock = DirectoryLock.create(this.levelPath);
+         }
+ 
+         public String getLevelId() {
+@@ -358,14 +365,7 @@ public class LevelStorageSource {
+             return LevelStorageSource.getFolder(this.levelPath.toFile(), this.dimensionType); // CraftBukkit
+         }
+ 
+-        private void checkLock() {
+-            if (!this.lock.isValid()) {
+-                throw new IllegalStateException("Lock is no longer valid");
+-            }
+-        }
+-
+         public PlayerDataStorage createPlayerStorage() {
+-            this.checkLock();
+             return new PlayerDataStorage(this, LevelStorageSource.this.fixerUpper);
+         }
+ 
+@@ -376,25 +376,21 @@ public class LevelStorageSource {
+         }
+ 
+         public boolean convertLevel(ProgressListener progressListener) {
+-            this.checkLock();
+             return McRegionUpgrader.convertLevel(this, progressListener);
+         }
+ 
+         @Nullable
+         public LevelSummary getSummary() {
+-            this.checkLock();
+             return (LevelSummary) LevelStorageSource.this.readLevelData(this.levelPath.toFile(), LevelStorageSource.this.levelSummaryReader(this.levelPath.toFile(), false));
+         }
+ 
+         @Nullable
+         public WorldData getDataTag(DynamicOps<Tag> dynamicops, DataPackConfig datapackconfiguration) {
+-            this.checkLock();
+             return (WorldData) LevelStorageSource.this.readLevelData(this.levelPath.toFile(), LevelStorageSource.getLevelData(dynamicops, datapackconfiguration));
+         }
+ 
+         @Nullable
+         public DataPackConfig getDataPacks() {
+-            this.checkLock();
+             return (DataPackConfig) LevelStorageSource.this.readLevelData(this.levelPath.toFile(), LevelStorageSource::getDataPacks);
+         }
+ 
+@@ -410,143 +406,15 @@ public class LevelStorageSource {
+             nbttagcompound2.put("Data", nbttagcompound1);
+ 
+             try {
+-                File file1 = File.createTempFile("level", ".dat", file);
+-
+-                NbtIo.writeCompressed(nbttagcompound2, file1);
+-                File file2 = new File(file, "level.dat_old");
+-                File file3 = new File(file, "level.dat");
+-
+-                Util.safeReplaceFile(file3, file1, file2);
++                SkyPaper.INSTANCE.getWorldDao().saveWorldData(file.getName(), nbttagcompound2);
+             } catch (Exception exception) {
+                 LevelStorageSource.LOGGER.error("Failed to save level {}", file, exception);
+             }
+-
+-        }
+-
+-        public Optional<Path> getIconFile() {
+-            return !this.lock.isValid() ? Optional.empty() : Optional.of(this.levelPath.resolve("icon.png"));
+-        }
+-
+-        public void deleteLevel() throws IOException {
+-            this.checkLock();
+-            final Path path = this.levelPath.resolve("session.lock");
+-            int i = 1;
+-
+-            while (i <= 5) {
+-                LevelStorageSource.LOGGER.info("Attempt {}...", i);
+-
+-                try {
+-                    Files.walkFileTree(this.levelPath, new SimpleFileVisitor<Path>() {
+-                        public FileVisitResult visitFile(Path path1, BasicFileAttributes basicfileattributes) throws IOException {
+-                            if (!path1.equals(path)) {
+-                                LevelStorageSource.LOGGER.debug("Deleting {}", path1);
+-                                Files.delete(path1);
+-                            }
+-
+-                            return FileVisitResult.CONTINUE;
+-                        }
+-
+-                        public FileVisitResult postVisitDirectory(Path path1, IOException ioexception) throws IOException {
+-                            if (ioexception != null) {
+-                                throw ioexception;
+-                            } else {
+-                                if (path1.equals(LevelStorageAccess.this.levelPath)) {
+-                                    LevelStorageAccess.this.lock.close();
+-                                    Files.deleteIfExists(path);
+-                                }
+-
+-                                Files.delete(path1);
+-                                return FileVisitResult.CONTINUE;
+-                            }
+-                        }
+-                    });
+-                    break;
+-                } catch (IOException ioexception) {
+-                    if (i >= 5) {
+-                        throw ioexception;
+-                    }
+-
+-                    LevelStorageSource.LOGGER.warn("Failed to delete {}", this.levelPath, ioexception);
+-
+-                    try {
+-                        Thread.sleep(500L);
+-                    } catch (InterruptedException interruptedexception) {
+-                        ;
+-                    }
+-
+-                    ++i;
+-                }
+-            }
+-
+-        }
+-
+-        public void renameLevel(String name) throws IOException {
+-            this.checkLock();
+-            File file = new File(LevelStorageSource.this.baseDir.toFile(), this.levelId);
+-
+-            if (file.exists()) {
+-                File file1 = new File(file, "level.dat");
+-
+-                if (file1.exists()) {
+-                    CompoundTag nbttagcompound = NbtIo.readCompressed(file1);
+-                    CompoundTag nbttagcompound1 = nbttagcompound.getCompound("Data");
+-
+-                    nbttagcompound1.putString("LevelName", name);
+-                    NbtIo.writeCompressed(nbttagcompound, file1);
+-                }
+-
+-            }
+-        }
+-
+-        public long makeWorldBackup() throws IOException {
+-            this.checkLock();
+-            String s = LocalDateTime.now().format(LevelStorageSource.FORMATTER);
+-            String s1 = s + "_" + this.levelId;
+-            Path path = LevelStorageSource.this.getBackupPath();
+-
+-            try {
+-                Files.createDirectories(Files.exists(path, new LinkOption[0]) ? path.toRealPath() : path);
+-            } catch (IOException ioexception) {
+-                throw new RuntimeException(ioexception);
+-            }
+-
+-            Path path1 = path.resolve(FileUtil.findAvailableName(path, s1, ".zip"));
+-            final ZipOutputStream zipoutputstream = new ZipOutputStream(new BufferedOutputStream(Files.newOutputStream(path1)));
+-
+-            try {
+-                final Path path2 = Paths.get(this.levelId);
+-
+-                Files.walkFileTree(this.levelPath, new SimpleFileVisitor<Path>() {
+-                    public FileVisitResult visitFile(Path path3, BasicFileAttributes basicfileattributes) throws IOException {
+-                        if (path3.endsWith("session.lock")) {
+-                            return FileVisitResult.CONTINUE;
+-                        } else {
+-                            String s2 = path2.resolve(LevelStorageAccess.this.levelPath.relativize(path3)).toString().replace('\\', '/');
+-                            ZipEntry zipentry = new ZipEntry(s2);
+-
+-                            zipoutputstream.putNextEntry(zipentry);
+-                            com.google.common.io.Files.asByteSource(path3.toFile()).copyTo(zipoutputstream);
+-                            zipoutputstream.closeEntry();
+-                            return FileVisitResult.CONTINUE;
+-                        }
+-                    }
+-                });
+-            } catch (Throwable throwable) {
+-                try {
+-                    zipoutputstream.close();
+-                } catch (Throwable throwable1) {
+-                    throwable.addSuppressed(throwable1);
+-                }
+-
+-                throw throwable;
+-            }
+-
+-            zipoutputstream.close();
+-            return Files.size(path1);
+         }
+ 
++        @Override
+         public void close() throws IOException {
+-            this.lock.close();
++
+         }
+     }
+ }
+diff --git a/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java b/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java
+index 35c39aed9583275ef25d32c783715798b52bdb63..5da951e1e9d2581b3cec28397f1286837fa9dee1 100644
+--- a/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java
++++ b/src/main/java/net/minecraft/world/level/storage/PlayerDataStorage.java
+@@ -22,13 +22,18 @@ import org.bukkit.craftbukkit.entity.CraftPlayer;
+ public class PlayerDataStorage {
+ 
+     private static final Logger LOGGER = LogManager.getLogger();
+-    private final File playerDir;
++    private File playerDir;
+     protected final DataFixer fixerUpper;
+ 
+-    public PlayerDataStorage(LevelStorageSource.LevelStorageAccess session, DataFixer dataFixer) {
++    public PlayerDataStorage(LevelStorageSource.LevelStorageAccess session, DataFixer dataFixer)
++    {
+         this.fixerUpper = dataFixer;
+-        this.playerDir = session.getLevelPath(LevelResource.PLAYER_DATA_DIR).toFile();
+-        this.playerDir.mkdirs();
++
++        if (!org.spigotmc.SpigotConfig.disablePlayerDataSaving)
++        {
++            this.playerDir = session.getLevelPath(LevelResource.PLAYER_DATA_DIR).toFile();
++            this.playerDir.mkdirs();
++        }
+     }
+ 
+     public void save(Player player) {
+diff --git a/src/main/java/org/bukkit/craftbukkit/generator/CraftWorldInfo.java b/src/main/java/org/bukkit/craftbukkit/generator/CraftWorldInfo.java
+index aeffb30cd91d4b21850059d33070c537bd5cb25e..fe3d2ea6369f3661f4e79b50852498601fa18da2 100644
+--- a/src/main/java/org/bukkit/craftbukkit/generator/CraftWorldInfo.java
++++ b/src/main/java/org/bukkit/craftbukkit/generator/CraftWorldInfo.java
+@@ -20,7 +20,7 @@ public class CraftWorldInfo implements WorldInfo {
+ 
+     public CraftWorldInfo(ServerLevelData worldDataServer, LevelStorageSource.LevelStorageAccess session, World.Environment environment, DimensionType dimensionManager) {
+         this.name = worldDataServer.getLevelName();
+-        this.uuid = WorldUUID.getUUID(session.levelPath.toFile());
++        this.uuid = WorldUUID.getUUID(session.levelPath.toFile()).uuid;
+         this.environment = environment;
+         this.seed = ((PrimaryLevelData) worldDataServer).worldGenSettings().seed();
+         this.minHeight = dimensionManager.minY();
+diff --git a/src/main/java/org/bukkit/craftbukkit/util/WorldUUID.java b/src/main/java/org/bukkit/craftbukkit/util/WorldUUID.java
+index 738100ffa60647790f0921cf31d5bbc2714e27dd..59e90ba32fe318968b0a01706d22a496c34498e0 100644
+--- a/src/main/java/org/bukkit/craftbukkit/util/WorldUUID.java
++++ b/src/main/java/org/bukkit/craftbukkit/util/WorldUUID.java
+@@ -7,6 +7,9 @@ import java.io.FileInputStream;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.util.UUID;
++
++import dev.cobblesword.skypaper.SkyPaper;
++import dev.cobblesword.skypaper.database.dto.WorldDTO;
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ 
+@@ -17,42 +20,11 @@ public final class WorldUUID {
+     private WorldUUID() {
+     }
+ 
+-    public static UUID getUUID(File baseDir) {
+-        File file1 = new File(baseDir, "uid.dat");
+-        if (file1.exists()) {
+-            DataInputStream dis = null;
+-            try {
+-                dis = new DataInputStream(new FileInputStream(file1));
+-                return new UUID(dis.readLong(), dis.readLong());
+-            } catch (IOException ex) {
+-                WorldUUID.LOGGER.warn("Failed to read " + file1 + ", generating new random UUID", ex);
+-            } finally {
+-                if (dis != null) {
+-                    try {
+-                        dis.close();
+-                    } catch (IOException ex) {
+-                        // NOOP
+-                    }
+-                }
+-            }
+-        }
+-        UUID uuid = UUID.randomUUID();
+-        DataOutputStream dos = null;
+-        try {
+-            dos = new DataOutputStream(new FileOutputStream(file1));
+-            dos.writeLong(uuid.getMostSignificantBits());
+-            dos.writeLong(uuid.getLeastSignificantBits());
+-        } catch (IOException ex) {
+-            WorldUUID.LOGGER.warn("Failed to write " + file1, ex);
+-        } finally {
+-            if (dos != null) {
+-                try {
+-                    dos.close();
+-                } catch (IOException ex) {
+-                    // NOOP
+-                }
+-            }
+-        }
+-        return uuid;
++    public static WorldDTO getUUID(File baseDir) {
++        return SkyPaper.INSTANCE.getWorldDao().loadOrCreateUID(baseDir.getName());
++    }
++
++    public static WorldDTO getDatabaseIdAndUID(File baseDir) {
++        return SkyPaper.INSTANCE.getWorldDao().loadOrCreateUID(baseDir.getName());
+     }
+ }
